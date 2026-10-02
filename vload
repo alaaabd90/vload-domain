@@ -45,7 +45,7 @@ HTTP_TIMEOUT="${HTTP_TIMEOUT:-5}"
 NAABU_RATE="${NAABU_RATE:-5000}"         # naabu packets/sec
 PORTS_TO_SCAN="${PORTS_TO_SCAN:-80,443,8080,8443,8000,8888}"
 ENUM_TIMEOUT="${ENUM_TIMEOUT:-180}"      # hard cap per enumeration source (s)
-MAX_PARALLEL_DOMAINS="${MAX_PARALLEL_DOMAINS:-4}"  # domains enumerated at once (rest queue)
+MAX_PARALLEL_DOMAINS="${MAX_PARALLEL_DOMAINS:-20}" # domains enumerated at once (rest queue)
 CURL_TIMEOUT="${CURL_TIMEOUT:-25}"
 # Reverse-DNS (PTR) expansion tuning — the heaviest stage on big targets.
 PTR_MAX_NETS="${PTR_MAX_NETS:-1200}"     # max /24 subnets to sweep (densest first)
@@ -156,10 +156,26 @@ run_enumeration(){
     # concurrent amass process shares ~/.config/amass/amass.sqlite: they race
     # on the same local DB, which both drops results for some domains (lock
     # contention) and bleeds OTHER domains' records into this domain's output.
+    # -exclude SubdomainCenter: that source injects generated/mutated candidate
+    # names (see the subdomain.center removal above) — amass has its own
+    # integration with it, so excluding it here too keeps that noise fully
+    # out, not just from our own direct call. The rest (HackerTarget,
+    # ThreatMiner, SiteDossier, Riddler) are confirmed dead/quota-exhausted;
+    # Wayback/URLScan are already covered by our own direct calls below.
     ( timeout -k 15 "$ENUM_TIMEOUT" amass enum -passive -d "$domain" \
-        -dir "$d/amass_dir" -o "$d/amass.txt" &>/dev/null ) &
+        -dir "$d/amass_dir" \
+        -exclude HackerTarget,ThreatMiner,SiteDossier,Riddler,Wayback,URLScan,SubdomainCenter \
+        -o "$d/amass.txt" &>/dev/null ) &
 
+    # findomain tries ~8 sources in sequence internally; several are the same
+    # dead ones (ThreatCrowd unreachable, AnubisDB Cloudflare-blocked,
+    # ThreatMiner 522) that silently ate up to 120s+ per domain waiting on
+    # them — confirmed via direct timing: excluding them cut findomain from
+    # 88s (twitter.com) to 21s and from a 120s+ timeout-kill (whatsapp.net) to
+    # under 1s, with IDENTICAL result counts both times. urlscan/archiveorg
+    # are also excluded since we already query those sources directly below.
     $HAVE_FINDOMAIN && ( timeout -k 15 "$ENUM_TIMEOUT" findomain -t "$domain" -q \
+        --exclude-sources threatcrowd anubis threatminer bufferover_free bufferover_paid archiveorg urlscan certspotter \
         > "$d/findomain.txt" 2>/dev/null ) &
 
     # crt.sh — Certificate Transparency. Use the plain ?q=<domain> query: the
@@ -862,11 +878,14 @@ main(){
     mkdir -p "$WORKDIR/enum"
 
     # Enumerate domains in batches of MAX_PARALLEL_DOMAINS (each domain already
-    # runs its ~12 sources concurrently). Running ALL domains at once would fan
-    # out N×12 concurrent requests onto the SAME external hosts (crt.sh, OTX,
-    # hackertarget, urlscan, ...) and trip their per-IP rate limits — that's
-    # what silently zeroed out those sources on a 15-domain run. Capping
-    # concurrency here keeps per-domain yield consistent regardless of N.
+    # runs its ~9 sources concurrently). The real fix for rate-limit zeroing
+    # was removing/replacing the structurally fragile sources (hackertarget's
+    # tiny daily quota, certspotter's anon quota, OTX's auth-walled
+    # passive_dns) — not batch size: once those were gone, 15 domains fully
+    # unbatched (one round) showed no degradation across any remaining
+    # source, just ~2x faster than batching them. This cap now exists purely
+    # as a safety valve against a pathologically large domain list spawning
+    # thousands of concurrent local processes, not as a rate-limit mitigation.
     local d epids=() dlog i total=${#DOMAINS[@]}
     [ "$total" -gt 1 ] && info "Enumerating $total domain(s), ${MAX_PARALLEL_DOMAINS} at a time..."
     i=0

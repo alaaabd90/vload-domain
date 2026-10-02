@@ -37,7 +37,7 @@ ports | http_code | title | webserver | tech | ping
 
 ## How it works
 
-1. **Enumerate** — subfinder, amass (passive), assetfinder, findomain, crt.sh, AlienVault OTX, RapidDNS, Wayback, subdomain.center, urlscan.io — all domains and sources in parallel. All sources are free and require no API key. (`certspotter` and `hackertarget` were dropped: their anonymous quotas are exhausted globally and return nothing without a paid key; OTX now uses its still-open `url_list` endpoint instead of the auth-walled `passive_dns` one.)
+1. **Enumerate** — subfinder, amass (passive), assetfinder, findomain, crt.sh, AlienVault OTX, RapidDNS, Wayback, urlscan.io — all domains and sources in parallel. All sources are free and require no API key. (`certspotter` and `hackertarget` were dropped: their anonymous quotas are exhausted globally and return nothing without a paid key. `api.subdomain.center` was dropped: its output contains algorithmically generated/mutated candidate names, not genuine passive observations — confirmed via duplicate-token artifacts in its responses — and amass's own built-in integration with it is excluded too. OTX now uses its still-open `url_list` endpoint instead of the auth-walled `passive_dns` one. findomain and amass also exclude several sources confirmed dead or quota-exhausted — ThreatCrowd, AnubisDB, ThreatMiner, SiteDossier, Riddler, bufferover — which were previously silently eating up to 120s+ per domain waiting on them for zero benefit.)
 2. **Resolve** — the public-resolver set is first **validated** (flaky/poisoned resolvers that silently drop valid CNAME-chained hosts are removed), then a **two-pass** resolve runs: a fast bulk pass, followed by a patient, time-budgeted retry of only the leftovers to recover transient failures and slow CNAME chains.
 3. **Reverse-DNS expansion** — PTR-sweeps the /24 subnets of resolved IPs to find hosts no passive source lists (not a wordlist / brute-force).
 4. **Enrich** — org / ISP / country / ASN for every IP in one shot via Team Cymru bulk (no rate limits).
@@ -50,7 +50,7 @@ Every heavy stage is time-budgeted with partial-result flushing, so a run never 
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MAX_PARALLEL_DOMAINS` | 4 | domains enumerated at once (rest queue in batches) — raising this fans out more concurrent requests onto the same external APIs (crt.sh, OTX, hackertarget, urlscan...) and can trip their rate limits, silently zeroing those sources on large multi-domain runs |
+| `MAX_PARALLEL_DOMAINS` | 20 | domains enumerated at once (rest queue in batches) — exists as a safety valve against a huge domain list spawning too many local processes at once, not as rate-limit protection (the fragile sources that caused that were removed/fixed directly) |
 | `DNS_THREADS` | 600 | dnsx resolution concurrency |
 | `DNS_RETRY` | 2 | first-pass resolution retries (set `1` for a faster run) |
 | `RESOLVE2_BUDGET` | 180 | time cap (s) for the patient 2nd resolve pass |
