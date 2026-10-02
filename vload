@@ -162,9 +162,16 @@ run_enumeration(){
     # out, not just from our own direct call. The rest (HackerTarget,
     # ThreatMiner, SiteDossier, Riddler) are confirmed dead/quota-exhausted;
     # Wayback/URLScan are already covered by our own direct calls below.
+    # -r <static resolvers>: WITHOUT this, amass tries to auto-build its own
+    # resolver pool at startup, and running many instances at once makes that
+    # bootstrap step fail outright for most of them ("the system was unable
+    # to build the pool of untrusted resolvers" — confirmed by direct
+    # reproduction: only 1-5 of 15 concurrent amass runs produced ANY output
+    # without this; giving it a fixed list made all 15/15 succeed).
     ( timeout -k 15 "$ENUM_TIMEOUT" amass enum -passive -d "$domain" \
         -dir "$d/amass_dir" \
         -exclude HackerTarget,ThreatMiner,SiteDossier,Riddler,Wayback,URLScan,SubdomainCenter \
+        -r 8.8.8.8 -r 1.1.1.1 -r 9.9.9.9 -r 208.67.222.222 -r 94.140.14.14 -r 77.88.8.8 \
         -o "$d/amass.txt" &>/dev/null ) &
 
     # findomain tries ~8 sources in sequence internally; several are the same
