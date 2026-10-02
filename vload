@@ -39,6 +39,7 @@ step(){ echo -e "\n${CYAN}${BOLD}══ $* ══${NC}"; }
 DNS_THREADS="${DNS_THREADS:-600}"        # dnsx concurrency
 DNS_RETRY="${DNS_RETRY:-2}"
 DNS_TIMEOUT="${DNS_TIMEOUT:-3}"          # per-query timeout (s)
+RESOLVE2_BUDGET="${RESOLVE2_BUDGET:-180}" # time cap (s) for patient 2nd resolve pass
 HTTP_THREADS="${HTTP_THREADS:-400}"      # httpx concurrency
 HTTP_TIMEOUT="${HTTP_TIMEOUT:-5}"
 NAABU_RATE="${NAABU_RATE:-5000}"         # naabu packets/sec
@@ -243,19 +244,39 @@ clean_subs(){
 resolve(){
     step "Resolving DNS (dnsx, ${DNS_THREADS} threads)"
     build_resolvers
-    # JSON out: {"host":..,"a":[ips],"cname":[..]}
+
+    # ── Pass 1: fast bulk resolve ────────────────────────────────────────────
     dnsx -l "$WORKDIR/subs.txt" -r "$WORKDIR/resolvers.txt" \
          -t "$DNS_THREADS" -retry "$DNS_RETRY" -timeout "$DNS_TIMEOUT" \
          -a -cname -json -silent -nc 2>/dev/null > "$WORKDIR/dnsx.json"
-
-    # sub<TAB>ip  (first A record per host). Also collect unique IPs.
     jq -r 'select(.a!=null) | .host as $h | .a[0] | "\($h)\t\(.)"' \
         "$WORKDIR/dnsx.json" 2>/dev/null | sort -u > "$WORKDIR/resolved.tsv"
-    cut -f2 "$WORKDIR/resolved.tsv" | sort -u > "$WORKDIR/ips.txt"
 
-    local rs ips total
-    rs=$(count "$WORKDIR/resolved.tsv"); ips=$(count "$WORKDIR/ips.txt")
-    total=$(count "$WORKDIR/subs.txt")
+    local total p1; total=$(count "$WORKDIR/subs.txt"); p1=$(count "$WORKDIR/resolved.tsv")
+
+    # ── Pass 2: patient retry of ONLY the leftovers ──────────────────────────
+    # Catches transient failures and slow CNAME chains that one fast pass misses.
+    # Runs on the small unresolved subset with more retries + longer timeout,
+    # time-budgeted so it can never blow up at scale.
+    comm -23 <(sort -u "$WORKDIR/subs.txt") \
+             <(cut -f1 "$WORKDIR/resolved.tsv" | sort -u) > "$WORKDIR/_unresolved.tmp"
+    local nun; nun=$(count "$WORKDIR/_unresolved.tmp")
+    if [ "$nun" -gt 0 ]; then
+        info "Pass 2: retrying $nun unresolved names (patient, ${RESOLVE2_BUDGET}s budget)..."
+        timeout -k 10 "$RESOLVE2_BUDGET" dnsx -l "$WORKDIR/_unresolved.tmp" \
+             -r "$WORKDIR/resolvers.txt" -t "$DNS_THREADS" -retry 4 -timeout 6 \
+             -a -cname -json -silent -nc 2>/dev/null > "$WORKDIR/dnsx2.json" || true
+        local recovered
+        recovered=$(jq -r 'select(.a!=null) | .host as $h | .a[0] | "\($h)\t\(.)"' \
+            "$WORKDIR/dnsx2.json" 2>/dev/null | sort -u | tee -a "$WORKDIR/resolved.tsv" | wc -l)
+        sort -u "$WORKDIR/resolved.tsv" -o "$WORKDIR/resolved.tsv"
+        ok "Pass 2 recovered $recovered additional host(s)"
+        rm -f "$WORKDIR/dnsx2.json"
+    fi
+    rm -f "$WORKDIR/_unresolved.tmp"
+
+    cut -f2 "$WORKDIR/resolved.tsv" | sort -u > "$WORKDIR/ips.txt"
+    local rs ips; rs=$(count "$WORKDIR/resolved.tsv"); ips=$(count "$WORKDIR/ips.txt")
     ok "$rs/$total subdomains resolved → $ips unique IPs"
     [ "$rs" -eq 0 ] && { err "Nothing resolved — aborting"; exit 1; }
 }
