@@ -1,0 +1,743 @@
+#!/usr/bin/env bash
+###############################################################################
+# Subdomain Recon — rewritten, fast & robust (Kali / WSL2)
+#
+# Pipeline:
+#   enumerate (parallel sources) -> clean/dedupe -> resolve (dnsx, JSON)
+#   -> enrich unique IPs (ip-api batch) -> ports (naabu) -> PTR + ping (per IP)
+#   -> HTTP probe (httpx) -> assemble one fully-populated row per subdomain
+#
+# Design notes:
+#   * All parsing is JSON via jq — no brittle awk/regex on tool output.
+#   * Every expensive lookup (org/isp, ports, ping, PTR) is done ONCE per
+#     unique IP, not once per subdomain — huge speedup on CDN-heavy targets.
+#   * Real ProjectDiscovery Go binaries are forced onto PATH (a python
+#     "httpx" wrapper otherwise shadows the recon httpx).
+#   * No hard-coded secrets. Telegram is opt-in via env vars.
+###############################################################################
+
+set -o pipefail
+shopt -s lastpipe
+
+# ── Make sure the Go recon binaries win over any python shim ─────────────────
+export PATH="$HOME/go/bin:/usr/local/go/bin:$PATH"
+
+# ── Colors ───────────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+    RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+    BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+else
+    RED=; GREEN=; YELLOW=; BLUE=; CYAN=; BOLD=; NC=
+fi
+info(){ echo -e "${BLUE}[*]${NC} $*"; }
+ok(){   echo -e "${GREEN}[+]${NC} $*"; }
+warn(){ echo -e "${YELLOW}[!]${NC} $*"; }
+err(){  echo -e "${RED}[-]${NC} $*" >&2; }
+step(){ echo -e "\n${CYAN}${BOLD}══ $* ══${NC}"; }
+
+# ── Tunables (override via environment) ──────────────────────────────────────
+DNS_THREADS="${DNS_THREADS:-600}"        # dnsx concurrency
+DNS_RETRY="${DNS_RETRY:-2}"
+DNS_TIMEOUT="${DNS_TIMEOUT:-3}"          # per-query timeout (s)
+HTTP_THREADS="${HTTP_THREADS:-400}"      # httpx concurrency
+HTTP_TIMEOUT="${HTTP_TIMEOUT:-5}"
+NAABU_RATE="${NAABU_RATE:-5000}"         # naabu packets/sec
+PORTS_TO_SCAN="${PORTS_TO_SCAN:-80,443,8080,8443,8000,8888}"
+ENUM_TIMEOUT="${ENUM_TIMEOUT:-180}"      # hard cap per enumeration source (s)
+CURL_TIMEOUT="${CURL_TIMEOUT:-25}"
+# Reverse-DNS (PTR) expansion tuning — the heaviest stage on big targets.
+PTR_MAX_NETS="${PTR_MAX_NETS:-1200}"     # max /24 subnets to sweep (densest first)
+PTR_THREADS="${PTR_THREADS:-1500}"       # PTR is lightweight → high concurrency
+PTR_BUDGET="${PTR_BUDGET:-300}"          # hard time budget for the sweep (partial OK)
+PLACEHOLDER="-"                          # shown when a value is genuinely absent
+
+# ── Telegram (opt-in): export TELEGRAM_TOKEN and TELEGRAM_CHAT_ID to enable ──
+TELEGRAM_TOKEN="${TELEGRAM_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+
+# ── Workspace ────────────────────────────────────────────────────────────────
+OUTBASE="${OUTBASE:-$HOME/recon}"
+WORKDIR=""            # set in setup_workspace
+FINAL=""              # final pipe-delimited results file
+TERMINATED=false
+
+trap 'terminate' INT TERM
+terminate(){ TERMINATED=true; echo; err "Interrupted — partial results (if any) are in: ${WORKDIR:-<none>}"; exit 130; }
+
+###############################################################################
+# Setup
+###############################################################################
+check_tools(){
+    local required=(subfinder assetfinder amass dnsx httpx naabu jq curl fping sort awk sed grep)
+    local missing=()
+    for t in "${required[@]}"; do command -v "$t" &>/dev/null || missing+=("$t"); done
+
+    # netcat (either flavour) is needed for the Team Cymru bulk IP→ASN lookup.
+    if command -v nc &>/dev/null; then NC_BIN=nc
+    elif command -v netcat &>/dev/null; then NC_BIN=netcat
+    else missing+=("nc/netcat"); fi
+
+    # httpx must be the ProjectDiscovery Go binary, not the python package.
+    if command -v httpx &>/dev/null && ! httpx -version &>/dev/null; then
+        err "The 'httpx' on PATH is not the ProjectDiscovery tool."
+        err "Install it:  go install github.com/projectdiscovery/httpx/cmd/httpx@latest"
+        missing+=("httpx(go)")
+    fi
+
+    # Try to auto-install any missing recon binaries straight from the
+    # vload-domain release (exact pinned versions), then re-check.
+    if [ "${#missing[@]}" -gt 0 ]; then
+        warn "Missing tools: ${missing[*]} — attempting auto-install from vload-domain release..."
+        autoinstall_tools "${missing[@]}"
+        missing=()
+        for t in "${required[@]}"; do command -v "$t" &>/dev/null || missing+=("$t"); done
+        if command -v nc &>/dev/null; then NC_BIN=nc
+        elif command -v netcat &>/dev/null; then NC_BIN=netcat
+        else missing+=("nc/netcat"); fi
+    fi
+
+    if [ "${#missing[@]}" -gt 0 ]; then
+        err "Still missing: ${missing[*]}"
+        echo "   Install everything with one command:"
+        echo "     curl -fsSL https://raw.githubusercontent.com/alaaabd90/vload-domain/main/install.sh | sudo bash"
+        exit 1
+    fi
+    command -v findomain &>/dev/null && HAVE_FINDOMAIN=true || HAVE_FINDOMAIN=false
+    ok "All required tools present${HAVE_FINDOMAIN:+ (findomain: $HAVE_FINDOMAIN)}"
+}
+
+# Pull missing recon binaries from the vload-domain release (gzip'd assets).
+# apt tools (jq/curl/fping/whois/nc…) are handled by install.sh, not here.
+autoinstall_tools(){
+    local repo_dl="https://github.com/alaaabd90/vload-domain/releases/latest/download"
+    local bin="/usr/local/bin" sudo="" t tmp
+    [ "$(id -u)" -ne 0 ] && sudo="sudo"
+    for t in "$@"; do
+        case "$t" in
+            subfinder|dnsx|httpx|naabu|amass|assetfinder|findomain) ;;
+            *) continue ;;   # system tools -> leave to install.sh / apt
+        esac
+        tmp=$(mktemp)
+        if curl -fsSL "${repo_dl}/${t}.gz" -o "${tmp}.gz" 2>/dev/null \
+           && gunzip -f "${tmp}.gz" 2>/dev/null; then
+            $sudo install -m 0755 "$tmp" "${bin}/${t}" 2>/dev/null && ok "  installed $t from repo"
+        fi
+        rm -f "$tmp" "${tmp}.gz" 2>/dev/null || true
+    done
+}
+
+setup_workspace(){
+    local label="$1"
+    local ts; ts=$(date +%Y%m%d_%H%M%S)
+    WORKDIR="$OUTBASE/${label}_${ts}"
+    mkdir -p "$WORKDIR" || { err "Cannot create $WORKDIR"; exit 1; }
+    FINAL="$WORKDIR/subdomains.txt"
+    info "Workspace: ${BOLD}$WORKDIR${NC}"
+}
+
+###############################################################################
+# 1. Enumeration — every source runs in parallel, each with a hard timeout
+###############################################################################
+run_enumeration(){
+    local domain="$1"
+    # Per-domain subdir so multiple domains can enumerate in parallel without
+    # clobbering each other's source files.
+    local d="$WORKDIR/enum/$(printf '%s' "$domain" | tr -c 'a-zA-Z0-9.-' '_')"
+    mkdir -p "$d"
+    step "Enumerating subdomains for $domain"
+
+    ( timeout -k 15 "$ENUM_TIMEOUT" subfinder -d "$domain" -silent -all \
+        -o "$d/subfinder.txt" &>/dev/null ) &
+    ( timeout -k 15 "$ENUM_TIMEOUT" assetfinder --subs-only "$domain" \
+        > "$d/assetfinder.txt" 2>/dev/null ) &
+    ( timeout -k 15 "$ENUM_TIMEOUT" amass enum -passive -d "$domain" \
+        -o "$d/amass.txt" &>/dev/null ) &
+
+    $HAVE_FINDOMAIN && ( timeout -k 15 "$ENUM_TIMEOUT" findomain -t "$domain" -q \
+        > "$d/findomain.txt" 2>/dev/null ) &
+
+    # crt.sh — Certificate Transparency. Use the plain ?q=<domain> query: the
+    # %25. wildcard form returns 502 constantly, while the plain query returns
+    # all SAN entries (incl. subdomains). name_value can hold newline-separated
+    # names. crt.sh is flaky, so retry a few times.
+    ( for try in 1 2 3; do
+        timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time 40 \
+            "https://crt.sh/?q=${domain}&output=json" 2>/dev/null \
+            | jq -r '.[].name_value' 2>/dev/null \
+            | tr ',' '\n' | sed 's/\\n/\n/g' > "$d/crtsh.txt"
+        [ -s "$d/crtsh.txt" ] && break; sleep 3
+      done ) &
+
+    ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
+        "https://api.hackertarget.com/hostsearch/?q=${domain}" 2>/dev/null \
+        | cut -d',' -f1 > "$d/hackertarget.txt" ) &
+
+    ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
+        "https://rapiddns.io/subdomain/${domain}?full=1&down=1" 2>/dev/null \
+        | grep -oE '[a-zA-Z0-9._-]+\.'"${domain//./\\.}" > "$d/rapiddns.txt" ) &
+
+    # certspotter — Certificate Transparency (another CT source, different coverage)
+    ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
+        "https://api.certspotter.com/v1/issuances?domain=${domain}&include_subdomains=true&expand=dns_names" 2>/dev/null \
+        | jq -r '.[].dns_names[]?' 2>/dev/null > "$d/certspotter.txt" ) &
+
+    # AlienVault OTX — passive DNS
+    ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
+        "https://otx.alienvault.com/api/v1/indicators/domain/${domain}/passive_dns" 2>/dev/null \
+        | jq -r '.passive_dns[]?.hostname' 2>/dev/null > "$d/otx.txt" ) &
+
+    # Wayback Machine (web.archive.org) — historical hostnames
+    ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
+        "http://web.archive.org/cdx/search/cdx?url=*.${domain}&output=text&fl=original&collapse=urlkey&limit=50000" 2>/dev/null \
+        | sed -E 's#^https?://##; s#/.*##; s#:.*##' \
+        | grep -iE "\.${domain//./\\.}$" > "$d/wayback.txt" ) &
+
+    # subdomain.center — free aggregated passive source
+    ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
+        "https://api.subdomain.center/?domain=${domain}" 2>/dev/null \
+        | jq -r '.[]?' 2>/dev/null > "$d/subdomaincenter.txt" ) &
+
+    # urlscan.io — hostnames from indexed page scans
+    ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
+        "https://urlscan.io/api/v1/search/?q=domain:${domain}&size=10000" 2>/dev/null \
+        | jq -r '.results[]?.page.domain, .results[]?.task.domain' 2>/dev/null \
+        | grep -iE "\.${domain//./\\.}$" > "$d/urlscan.txt" ) &
+
+    wait   # all sources finish (each is bounded by ENUM_TIMEOUT)
+
+    local f
+    for f in "$d"/*.txt; do
+        [ -f "$f" ] || continue
+        ok "  [$domain] $(basename "$f" .txt) → $(count "$f")"
+    done
+    # NOTE: merging into raw_subs.txt is done by the caller after ALL domains
+    # finish (so domains can run in parallel safely).
+}
+
+###############################################################################
+# 2. Clean & dedupe — lowercase, keep only valid hostnames under the targets
+###############################################################################
+clean_subs(){
+    step "Cleaning & de-duplicating"
+    # lowercase, strip wildcards/spaces, keep syntactically valid FQDNs
+    tr '[:upper:]' '[:lower:]' < "$WORKDIR/raw_subs.txt" \
+        | sed 's/^\*\.//; s/[[:space:]]//g; s/\.$//' \
+        | grep -E '^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$' \
+        | sort -u > "$WORKDIR/unique_subs.txt"
+
+    # Keep only names that actually end in one of the target domains.
+    : > "$WORKDIR/scope.txt"
+    local dom
+    for dom in "${DOMAINS[@]}"; do grep -E "(^|\.)${dom//./\\.}$" "$WORKDIR/unique_subs.txt"; done \
+        | sort -u > "$WORKDIR/subs.txt"
+    rm -f "$WORKDIR/scope.txt"
+
+    local n; n=$(count "$WORKDIR/subs.txt")
+    ok "$n valid unique subdomains"
+    [ "$n" -eq 0 ] && { err "No subdomains found — aborting"; exit 1; }
+}
+
+###############################################################################
+# 3. Resolve with dnsx (single robust pass; it follows CNAMEs internally)
+###############################################################################
+resolve(){
+    step "Resolving DNS (dnsx, ${DNS_THREADS} threads)"
+    build_resolvers
+    # JSON out: {"host":..,"a":[ips],"cname":[..]}
+    dnsx -l "$WORKDIR/subs.txt" -r "$WORKDIR/resolvers.txt" \
+         -t "$DNS_THREADS" -retry "$DNS_RETRY" -timeout "$DNS_TIMEOUT" \
+         -a -cname -json -silent -nc 2>/dev/null > "$WORKDIR/dnsx.json"
+
+    # sub<TAB>ip  (first A record per host). Also collect unique IPs.
+    jq -r 'select(.a!=null) | .host as $h | .a[0] | "\($h)\t\(.)"' \
+        "$WORKDIR/dnsx.json" 2>/dev/null | sort -u > "$WORKDIR/resolved.tsv"
+    cut -f2 "$WORKDIR/resolved.tsv" | sort -u > "$WORKDIR/ips.txt"
+
+    local rs ips total
+    rs=$(count "$WORKDIR/resolved.tsv"); ips=$(count "$WORKDIR/ips.txt")
+    total=$(count "$WORKDIR/subs.txt")
+    ok "$rs/$total subdomains resolved → $ips unique IPs"
+    [ "$rs" -eq 0 ] && { err "Nothing resolved — aborting"; exit 1; }
+}
+
+build_resolvers(){
+    cat > "$WORKDIR/resolvers.txt" <<'EOF'
+8.8.8.8
+8.8.4.4
+1.1.1.1
+1.0.0.1
+9.9.9.9
+149.112.112.112
+208.67.222.222
+208.67.220.220
+94.140.14.14
+94.140.15.15
+76.76.19.19
+77.88.8.8
+77.88.8.1
+84.200.69.80
+84.200.70.40
+EOF
+    local extra
+    extra=$(curl -sf --max-time 8 \
+        "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt" 2>/dev/null | head -400)
+    [ -n "$extra" ] && echo "$extra" >> "$WORKDIR/resolvers.txt"
+    sort -u "$WORKDIR/resolvers.txt" -o "$WORKDIR/resolvers.txt"
+}
+
+###############################################################################
+# 3b. Reverse-DNS expansion — PTR-sweep the /24 subnets of resolved IPs.
+#     The target owns IP space; its PTR records reveal many hostnames that no
+#     passive source lists (edge-*, cloud-*, dohproxy-*, …). Not a wordlist —
+#     it reads reverse DNS of subnets we already know are in play.
+###############################################################################
+reverse_dns_expand(){
+    step "Reverse-DNS expansion — PTR sweep of discovered /24 subnets (no wordlist)"
+    # Order /24s by how many resolved IPs they contain (densest first) so the
+    # most productive subnets are swept before the time budget runs out.
+    awk -F. 'NF==4 && $1>=1 && $1<=255 {c[$1"."$2"."$3]++}
+             END{for(n in c) print c[n], n".0/24"}' "$WORKDIR/ips.txt" \
+        | sort -rn | awk '{print $2}' | head -n "$PTR_MAX_NETS" > "$WORKDIR/cidrs.tmp"
+    local nnets; nnets=$(count "$WORKDIR/cidrs.tmp")
+    [ "$nnets" -eq 0 ] && { ok "No subnets to sweep"; return 0; }
+    info "Sweeping $nnets /24 subnet(s), ${PTR_THREADS} threads, ${PTR_BUDGET}s budget..."
+    # Record which /24s we sweep, so ptr_and_ping treats every IP in them as
+    # covered (even IPs with no PTR record) and never re-queries them.
+    sed 's#\.0/24$##' "$WORKDIR/cidrs.tmp" | sort -u > "$WORKDIR/swept_nets.txt"
+
+    # High concurrency + 1 retry + short timeout; wrapped in a hard time budget.
+    # JSON output captures BOTH the hostnames (for discovering new subdomains)
+    # AND the ip→PTR map, which ptr_and_ping reuses so it never redoes reverse
+    # DNS on these same IPs (eliminates a whole redundant PTR pass).
+    timeout -k 10 "$PTR_BUDGET" dnsx -l "$WORKDIR/cidrs.tmp" -ptr -json -silent -nc \
+         -t "$PTR_THREADS" -retry 1 -r "$WORKDIR/resolvers.txt" 2>/dev/null \
+        > "$WORKDIR/ptr_sweep.json"
+
+    # ip<TAB>ptr — kept for reuse (ptr_sweep.tsv is NOT a .tmp, survives cleanup)
+    jq -r 'select(.ptr!=null) | "\(.host)\t\(.ptr[0])"' "$WORKDIR/ptr_sweep.json" 2>/dev/null \
+        | sed 's/\.$//' | sort -u -k1,1 > "$WORKDIR/ptr_sweep.tsv"
+    jq -r 'select(.ptr!=null) | .ptr[]' "$WORKDIR/ptr_sweep.json" 2>/dev/null \
+        | tr '[:upper:]' '[:lower:]' | sed 's/\.$//' | sort -u > "$WORKDIR/ptr_names.tmp"
+    rm -f "$WORKDIR/ptr_sweep.json"
+
+    # keep only names inside our target scope, valid FQDNs
+    local dom
+    for dom in "${DOMAINS[@]}"; do
+        grep -E "(^|\.)${dom//./\\.}$" "$WORKDIR/ptr_names.tmp"
+    done | grep -E '^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$' \
+         | sort -u > "$WORKDIR/ptr_scope.tmp"
+
+    comm -23 "$WORKDIR/ptr_scope.tmp" <(sort -u "$WORKDIR/subs.txt") > "$WORKDIR/ptr_new.tmp"
+    local nscope nnew; nscope=$(count "$WORKDIR/ptr_scope.tmp"); nnew=$(count "$WORKDIR/ptr_new.tmp")
+    ok "PTR sweep: $nscope in-scope hostnames ($nnew new, not seen by passive sources)"
+    [ "$nnew" -eq 0 ] && { rm -f "$WORKDIR"/ptr_*.tmp "$WORKDIR/cidrs.tmp"; return 0; }
+
+    # fold new names into the master list and resolve them, merging results
+    cat "$WORKDIR/ptr_new.tmp" >> "$WORKDIR/subs.txt"
+    sort -u "$WORKDIR/subs.txt" -o "$WORKDIR/subs.txt"
+
+    dnsx -l "$WORKDIR/ptr_new.tmp" -r "$WORKDIR/resolvers.txt" \
+         -t "$DNS_THREADS" -retry "$DNS_RETRY" -timeout "$DNS_TIMEOUT" \
+         -a -json -silent -nc 2>/dev/null \
+        | jq -r 'select(.a!=null) | .host as $h | .a[0] | "\($h)\t\(.)"' 2>/dev/null \
+        >> "$WORKDIR/resolved.tsv"
+    sort -u "$WORKDIR/resolved.tsv" -o "$WORKDIR/resolved.tsv"
+    cut -f2 "$WORKDIR/resolved.tsv" | sort -u > "$WORKDIR/ips.txt"
+
+    ok "After expansion: $(count "$WORKDIR/resolved.tsv") resolved subdomains → $(count "$WORKDIR/ips.txt") unique IPs"
+    rm -f "$WORKDIR"/ptr_*.tmp "$WORKDIR/cidrs.tmp"
+}
+
+###############################################################################
+# 4. Enrich unique IPs — Team Cymru bulk IP→ASN (ONE query, NO rate limit)
+#    Returns ASN, country and org (AS name) for every routable IP at once.
+#    This replaces ip-api, whose 15-req/min free limit left whole blocks of
+#    real IPs with "-" (org/isp/country/asn).
+###############################################################################
+enrich_ips(){
+    local n; n=$(count "$WORKDIR/ips.txt")
+    step "Enriching $n unique IPs (Team Cymru bulk — ASN/org/country, no rate limit)"
+    : > "$WORKDIR/ipinfo.tsv"     # ip<TAB>org<TAB>isp<TAB>country<TAB>asn
+
+    # Bulk query: begin / verbose / <ips> / end  →  whois.cymru.com:43
+    { printf 'begin\nverbose\n'; cat "$WORKDIR/ips.txt"; printf 'end\n'; } \
+        | timeout -k 10 120 "$NC_BIN" whois.cymru.com 43 2>/dev/null > "$WORKDIR/cymru.raw"
+
+    # Output rows look like:
+    #   32934 | 66.220.144.141 | 66.220.144.0/21 | US | arin | 2009-.. | FACEBOOK - Facebook, Inc., US
+    awk -F'|' '
+    function trim(s){ gsub(/^[ \t]+|[ \t]+$/,"",s); return s }
+    /Bulk mode|Error:|^[[:space:]]*$/ { next }
+    NF>=7 {
+        asn=trim($1); ip=trim($2); cc=trim($4); asname=trim($7)
+        if (ip=="" || ip=="IP") next
+        org=asname
+        p=index(asname," - ")
+        if (p>0) org=substr(asname,p+3)      # drop the "HANDLE - " prefix
+        sub(/, *[A-Z][A-Z]$/,"",org)         # drop the trailing ", US" country code
+        if (asn=="NA" || asn=="") { org="Private/Reserved"; cc=(cc==""?"ZZ":cc); asn="private" }
+        else { asn="AS" asn }
+        if (org=="") org="Unknown"
+        if (cc=="")  cc="ZZ"
+        print ip "\t" org "\t" org "\t" cc "\t" asn      # isp = org (same AS)
+    }' "$WORKDIR/cymru.raw" | sort -u -k1,1 > "$WORKDIR/ipinfo.tsv"
+
+    local got; got=$(count "$WORKDIR/ipinfo.tsv")
+    ok "Enriched $got/$n IPs"
+    if [ "$got" -lt "$n" ]; then
+        warn "$((n-got)) IP(s) not returned by Cymru — retrying those with ip-api"
+        enrich_ipapi_fallback
+    fi
+    rm -f "$WORKDIR/cymru.raw"
+}
+
+# Fallback only for the handful Cymru didn't answer (keeps us off ip-api's limit)
+enrich_ipapi_fallback(){
+    cut -f1 "$WORKDIR/ipinfo.tsv" | sort -u > "$WORKDIR/_have.tmp"
+    comm -23 "$WORKDIR/ips.txt" "$WORKDIR/_have.tmp" > "$WORKDIR/_miss.tmp"
+    local miss; miss=$(count "$WORKDIR/_miss.tmp")
+    [ "$miss" -eq 0 ] && { rm -f "$WORKDIR/_have.tmp" "$WORKDIR/_miss.tmp"; return; }
+    split -l 100 "$WORKDIR/_miss.tmp" "$WORKDIR/ipchunk_"
+    local batch
+    for batch in "$WORKDIR"/ipchunk_*; do
+        [ -f "$batch" ] || continue
+        local payload resp
+        payload=$(jq -R -s -c 'split("\n")|map(select(length>0))' < "$batch")
+        resp=$(curl -s -m 20 -X POST \
+            "http://ip-api.com/batch?fields=status,query,org,isp,as,country" \
+            -H "Content-Type: application/json" -d "$payload" 2>/dev/null)
+        [ -n "$resp" ] && echo "$resp" | jq -r '.[]|select(.status=="success")
+            | [.query,(.org//"Unknown"),(.isp//"Unknown"),(.country//"ZZ"),
+               ((.as|split(" ")[0])//"-")]|@tsv' 2>/dev/null >> "$WORKDIR/ipinfo.tsv"
+        sleep 1.4
+    done
+    # Any still missing → label clearly so the final table never shows a bare "-"
+    cut -f1 "$WORKDIR/ipinfo.tsv" | sort -u > "$WORKDIR/_have.tmp"
+    comm -23 "$WORKDIR/ips.txt" "$WORKDIR/_have.tmp" \
+        | awk '{print $1"\tUnknown\tUnknown\tZZ\tunknown"}' >> "$WORKDIR/ipinfo.tsv"
+    rm -f "$WORKDIR"/ipchunk_* "$WORKDIR/_have.tmp" "$WORKDIR/_miss.tmp"
+}
+
+###############################################################################
+# 5. Port scan unique IPs (naabu)
+###############################################################################
+scan_ports(){
+    step "Scanning ports [$PORTS_TO_SCAN] on $(count "$WORKDIR/ips.txt") IPs (naabu)"
+    naabu -l "$WORKDIR/ips.txt" -p "$PORTS_TO_SCAN" -rate "$NAABU_RATE" \
+          -json -silent -nc 2>/dev/null > "$WORKDIR/naabu.json"
+    # ip<TAB>comma,separated,ports  (naabu can emit a port twice — dedupe them)
+    jq -r '"\(.ip)\t\(.port)"' "$WORKDIR/naabu.json" 2>/dev/null \
+        | sort -t$'\t' -k1,1 -k2,2n -u \
+        | awk -F'\t' '{p[$1]=(p[$1]?p[$1]","$2:$2)} END{for(i in p)print i"\t"p[i]}' \
+        > "$WORKDIR/ports.tsv"
+    ok "$(count "$WORKDIR/ports.tsv") IPs have open ports"
+}
+
+###############################################################################
+# 6. PTR (reverse DNS) + ping — once per unique IP
+###############################################################################
+ptr_and_ping(){
+    step "Reverse DNS + ping ($(count "$WORKDIR/ips.txt") IPs)"
+    # Reuse PTR records already gathered by the /24 sweep (reverse_dns_expand);
+    # only query reverse DNS for IPs the sweep didn't cover. This avoids redoing
+    # PTR on thousands of IPs. PTR work and ping run concurrently.
+    : > "$WORKDIR/ptr.tsv"
+    local miss="$WORKDIR/_missptr.tmp"; cp "$WORKDIR/ips.txt" "$miss"
+    if [ -s "$WORKDIR/ptr_sweep.tsv" ]; then
+        # Reuse the sweep's PTR records for IPs in our final set.
+        awk -F'\t' 'NR==FNR{keep[$1]=1;next} ($1 in keep)' \
+            "$WORKDIR/ips.txt" "$WORKDIR/ptr_sweep.tsv" > "$WORKDIR/ptr.tsv"
+        # "miss" = only IPs whose /24 was NOT swept (truly need a fresh query).
+        # IPs in a swept /24 are covered even if they have no PTR record.
+        if [ -s "$WORKDIR/swept_nets.txt" ]; then
+            awk -F. 'NR==FNR{sw[$0]=1;next}{p=$1"."$2"."$3; if(!(p in sw)) print}' \
+                "$WORKDIR/swept_nets.txt" "$WORKDIR/ips.txt" > "$miss"
+        else
+            comm -23 <(sort -u "$WORKDIR/ips.txt") <(cut -f1 "$WORKDIR/ptr.tsv" | sort -u) > "$miss"
+        fi
+    fi
+    local nmiss; nmiss=$(count "$miss")
+    (
+        if [ "$nmiss" -gt 0 ]; then
+            dnsx -l "$miss" -r "$WORKDIR/resolvers.txt" -t "$DNS_THREADS" \
+                 -ptr -json -silent -nc 2>/dev/null \
+                | jq -r 'select(.ptr!=null) | "\(.host)\t\(.ptr[0])"' 2>/dev/null \
+                | sed 's/\.$//' >> "$WORKDIR/ptr.tsv"
+        fi
+    ) &
+    local ptr_pid=$!
+
+    # fping: one parallel sweep. With -c1 the summary line is:
+    #   1.2.3.4 : xmt/rcv/%loss = 1/1/0%, min/avg/max = 12.3/12.3/12.3   (no " ms")
+    # A host is up when rcv>0; report its avg RTT, else "down".
+    fping -c1 -t500 -q -f "$WORKDIR/ips.txt" 2>&1 \
+        | awk '/: xmt\/rcv/ {
+              ip=$1; up=0; avg="";
+              if (match($0,/= [0-9]+\/[0-9]+\/[0-9]+%/)) {
+                  t=substr($0,RSTART+2,RLENGTH-3); split(t,x,"/");  # xmt/rcv/loss
+                  if (x[2]+0 > 0) up=1;
+              }
+              if (up && match($0,/min\/avg\/max = [0-9.]+\/[0-9.]+\/[0-9.]+/)) {
+                  m=substr($0,RSTART,RLENGTH); sub(/.*= /,"",m); split(m,y,"/");
+                  printf "%s\t%s ms\n", ip, y[2];
+              } else { printf "%s\tdown\n", ip }
+          }' > "$WORKDIR/ping.tsv"
+    wait "$ptr_pid"   # make sure the concurrent PTR lookup is done
+    rm -f "$WORKDIR/_missptr.tmp"
+    ok "$(count "$WORKDIR/ptr.tsv") IPs have a PTR record ($nmiss queried fresh); pinged $(count "$WORKDIR/ping.tsv") IPs"
+}
+
+###############################################################################
+# 7. HTTP probe (httpx) — status, title, webserver, tech
+###############################################################################
+http_probe(){
+    step "HTTP probing $(count "$WORKDIR/resolved.tsv") live subdomains (httpx)"
+    cut -f1 "$WORKDIR/resolved.tsv" > "$WORKDIR/live_subs.txt"
+    httpx -l "$WORKDIR/live_subs.txt" -json -silent -nc \
+          -status-code -title -web-server -tech-detect \
+          -threads "$HTTP_THREADS" -timeout "$HTTP_TIMEOUT" -retries 1 \
+          2>/dev/null > "$WORKDIR/httpx.json"
+    # sub<TAB>code<TAB>title<TAB>server<TAB>tech
+    # Strip '|' from text fields — it is our final column delimiter and page
+    # titles legitimately contain it (e.g. "Foo | Bar").
+    jq -r '[.input, (.status_code|tostring),
+            ((.title//"")|gsub("[\t\n|]";" ")),
+            ((.webserver//"-")|gsub("[\t\n|]";" ")),
+            ((.tech//[])|join(",")|gsub("[\t\n|]";" "))] | @tsv' \
+        "$WORKDIR/httpx.json" 2>/dev/null | sort -u > "$WORKDIR/http.tsv"
+    ok "$(count "$WORKDIR/http.tsv") subdomains answered HTTP(S)"
+}
+
+###############################################################################
+# 8. Assemble — one fully-populated row per subdomain
+###############################################################################
+assemble(){
+    step "Assembling final report"
+    echo "maindomain|subdomain|ip|hostname|organization|isp|country|asn|ports|http_code|title|webserver|tech|ping" > "$FINAL"
+
+    DOMLIST=$(printf '%s\n' "${DOMAINS[@]}")
+
+    # Single awk pass: load every per-IP / per-sub lookup table, then emit
+    # one fully-populated row per resolved subdomain (resolved.tsv read last).
+    awk -F'\t' -v OFS='|' -v PH="$PLACEHOLDER" -v domlist="$DOMLIST" '
+    function blank(x){ return (x==""||x=="null") ? PH : x }
+    function main_domain(s,   n,i,d){
+        n=split(domlist,D,"\n")
+        for(i=1;i<=n;i++){ d=D[i]; gsub(/\./,"\\.",d);
+            if(d!="" && s ~ ("(^|\\.)" d "$")) return D[i] }
+        return PH
+    }
+    FILENAME==F_IPINFO { org[$1]=$2; isp[$1]=$3; ctry[$1]=$4; asn[$1]=$5; next }
+    FILENAME==F_PORTS  { ports[$1]=$2; next }
+    FILENAME==F_PTR    { ptr[$1]=$2; next }
+    FILENAME==F_PING   { ping[$1]=$2; next }
+    FILENAME==F_HTTP   { code[$1]=$2; title[$1]=$3; srv[$1]=$4; tech[$1]=$5; next }
+    FILENAME==F_RES {
+        sd=$1; ip=$2
+        printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n",
+            main_domain(sd), sd, ip,
+            blank(ptr[ip]),
+            blank(org[ip]), blank(isp[ip]), blank(ctry[ip]), blank(asn[ip]),
+            blank(ports[ip]),
+            blank(code[sd]), blank(title[sd]), blank(srv[sd]), blank(tech[sd]),
+            blank(ping[ip])
+    }
+    ' F_IPINFO="$WORKDIR/ipinfo.tsv" F_PORTS="$WORKDIR/ports.tsv" \
+      F_PTR="$WORKDIR/ptr.tsv" F_PING="$WORKDIR/ping.tsv" F_HTTP="$WORKDIR/http.tsv" \
+      F_RES="$WORKDIR/resolved.tsv" \
+      "$WORKDIR/ipinfo.tsv" "$WORKDIR/ports.tsv" "$WORKDIR/ptr.tsv" \
+      "$WORKDIR/ping.tsv" "$WORKDIR/http.tsv" "$WORKDIR/resolved.tsv" \
+      >> "$FINAL"
+
+    ok "Wrote $(( $(count "$FINAL") - 1 )) rows → $FINAL"
+}
+
+###############################################################################
+# 9. Report: preview + where it is saved + how to copy from Windows
+###############################################################################
+report(){
+    step "FINAL RESULTS (first 20 rows)"
+    # Pure-awk column aligner (the 'column' command isn't always installed).
+    head -21 "$FINAL" | awk -F'|' '
+        { for(i=1;i<=NF;i++){ if(length($i)>w[i])w[i]=length($i); c[NR,i]=$i } nf[NR]=NF; rows=NR }
+        END{ for(r=1;r<=rows;r++){ for(i=1;i<=nf[r];i++) printf "%-*s  ", w[i], c[r,i]; print "";
+             if(r==1){ for(i=1;i<=nf[r];i++){ for(j=1;j<=w[i]+2;j++)printf "-"; } print "" } } }'
+    echo
+    local rows; rows=$(( $(count "$FINAL") - 1 ))
+    ok "Total subdomains in report: ${BOLD}$rows${NC}"
+
+    # Integrity check — warn on any empty/zero cell so we never ship a bad column.
+    local bad
+    bad=$(awk -F'|' 'NR>1{for(i=1;i<=NF;i++) if($i==""||$i=="0"||$i=="000"){print NR; break}}' "$FINAL" | wc -l)
+    if [ "$bad" -eq 0 ]; then
+        ok "Integrity check: no empty / zero cells in any column"
+    else
+        warn "Integrity check: $bad row(s) contain an empty/zero cell (shown as '-' is OK; literal empty is not)"
+    fi
+
+    echo
+    step "Where your results are saved"
+    printf "  ${BOLD}Inside Kali (WSL):${NC}\n"
+    printf "    %s\n\n" "$FINAL"
+
+    # Windows-visible path via \\wsl.localhost\<distro>\...  (printf %s so the
+    # backslashes are printed literally — echo -e would eat \r \f \root etc.)
+    local winpath winfile
+    winpath=$(wslpath -w "$WORKDIR" 2>/dev/null)
+    winfile=$(wslpath -w "$FINAL" 2>/dev/null)
+    if [ -n "$winpath" ]; then
+        printf "  ${BOLD}From Windows (paste into File Explorer's address bar):${NC}\n"
+        printf "    %s\n\n" "$winpath"
+        printf "  ${BOLD}Copy to your Windows Desktop (run in PowerShell on Windows):${NC}\n"
+        printf '    copy "%s" "%%USERPROFILE%%\\Desktop"\n\n' "$winfile"
+        printf "  ${BOLD}Or open the folder straight from Kali:${NC}\n"
+        printf '    explorer.exe "%s"\n' "$winpath"
+    else
+        warn "Could not derive the Windows path (wslpath)."
+        printf '    Your distro root is reachable from Windows at: \\\\wsl.localhost\\kali-linux\\root\n'
+    fi
+
+    if [ -n "$WIN_SAVED" ]; then
+        printf "\n  ${BOLD}${GREEN}✓ Auto-saved a copy to your Windows Documents:${NC}\n"
+        printf "    %s\n" "$(wslpath -w "$WIN_SAVED" 2>/dev/null || echo "$WIN_SAVED")"
+        printf "    (open Documents in File Explorer to find it)\n"
+    fi
+}
+
+###############################################################################
+# Telegram (opt-in)
+###############################################################################
+send_telegram(){
+    [ -z "$TELEGRAM_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ] && {
+        info "Telegram not configured (set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID to enable)"; return; }
+    local api="https://api.telegram.org/bot${TELEGRAM_TOKEN}"
+    local rows; rows=$(( $(count "$FINAL") - 1 ))
+    curl -sf -X POST "$api/sendMessage" \
+        --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+        --data-urlencode "text=✅ Recon done — ${rows} subdomains for: ${DOMAINS[*]}" >/dev/null \
+        && ok "Telegram message sent" || warn "Telegram message failed"
+    curl -sf -X POST "$api/sendDocument" \
+        -F "chat_id=${TELEGRAM_CHAT_ID}" -F "document=@${FINAL}" \
+        -F "caption=Subdomains — ${rows} entries" >/dev/null \
+        && ok "Telegram file sent" || warn "Telegram file send failed"
+}
+
+###############################################################################
+# Helpers
+###############################################################################
+count(){ [ -f "$1" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
+
+###############################################################################
+# Auto-copy the result into the Windows user's Documents (WSL only)
+# Works on any WSL PC — detects the folder dynamically (incl. OneDrive redirect).
+###############################################################################
+is_wsl(){ grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; }
+
+_win_ps(){  command -v powershell.exe 2>/dev/null && return
+            local p="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+            [ -x "$p" ] && echo "$p"; }
+_win_cmd(){ command -v cmd.exe 2>/dev/null && return
+            local p="/mnt/c/Windows/System32/cmd.exe"; [ -x "$p" ] && echo "$p"; }
+
+detect_win_docs(){
+    local bin raw base u b
+    # 1) PowerShell MyDocuments — honours OneDrive / redirected Documents
+    bin=$(_win_ps) && [ -n "$bin" ] && {
+        raw=$(cd /mnt/c 2>/dev/null && "$bin" -NoProfile -Command \
+              '[Environment]::GetFolderPath("MyDocuments")' 2>/dev/null | tr -d '\r')
+        [ -n "$raw" ] && { wslpath -u "$raw" 2>/dev/null; return 0; }
+    }
+    # 2) cmd USERPROFILE\Documents
+    bin=$(_win_cmd) && [ -n "$bin" ] && {
+        raw=$(cd /mnt/c 2>/dev/null && "$bin" /c "echo %USERPROFILE%" 2>/dev/null | tr -d '\r')
+        [ -n "$raw" ] && { echo "$(wslpath -u "$raw")/Documents"; return 0; }
+    }
+    # 3) scan mounted Windows drives for a real user's Documents folder
+    for base in /mnt/c /mnt/d /mnt/e; do
+        for u in "$base"/Users/*/; do
+            b=$(basename "$u")
+            case "$b" in Public|Default|"Default User"|"All Users"|desktop.ini|WsiAccount) continue;; esac
+            [ -d "${u}OneDrive/Documents" ] && { echo "${u}OneDrive/Documents"; return 0; }
+            [ -d "${u}Documents" ]          && { echo "${u}Documents";          return 0; }
+        done
+    done
+    return 1
+}
+
+WIN_SAVED=""
+save_to_windows(){
+    is_wsl || return 0
+    local docs; docs=$(detect_win_docs) \
+        || { warn "Windows Documents folder not found — skipping Windows copy"; return 0; }
+    mkdir -p "$docs" 2>/dev/null
+    local name="${DOMAINS[0]}_subdomains_$(date +%Y%m%d_%H%M%S).txt"
+    if cp "$FINAL" "$docs/$name" 2>/dev/null; then
+        WIN_SAVED="$docs/$name"
+    else
+        warn "Could not write to Windows Documents ($docs)"
+    fi
+}
+
+###############################################################################
+# Main
+###############################################################################
+main(){
+    echo -e "${CYAN}${BOLD}Subdomain Recon${NC}  —  $(date)"
+    check_tools
+
+    DOMAINS=("$@")
+    if [ "${#DOMAINS[@]}" -eq 0 ]; then
+        echo -ne "${YELLOW}[?] Enter target domain(s), space-separated: ${NC}"
+        read -r -a DOMAINS
+    fi
+    [ "${#DOMAINS[@]}" -eq 0 ] && { err "No domains given"; exit 1; }
+
+    setup_workspace "${DOMAINS[0]}"
+    : > "$WORKDIR/raw_subs.txt"
+    mkdir -p "$WORKDIR/enum"
+
+    # Enumerate every domain IN PARALLEL (each already runs its ~12 sources
+    # concurrently). For N domains this turns N×T into ~T. Each domain logs to
+    # its own file, printed in order afterwards; sources merge once all finish.
+    local d epids=() dlog
+    for d in "${DOMAINS[@]}"; do
+        dlog="$WORKDIR/enum/_log_$(printf '%s' "$d" | tr -c 'a-zA-Z0-9' '_').txt"
+        run_enumeration "$d" > "$dlog" 2>&1 &
+        epids+=("$!")
+    done
+    [ "${#DOMAINS[@]}" -gt 1 ] && info "Enumerating ${#DOMAINS[@]} domains in parallel..."
+    wait "${epids[@]}"
+    for d in "${DOMAINS[@]}"; do
+        cat "$WORKDIR/enum/_log_$(printf '%s' "$d" | tr -c 'a-zA-Z0-9' '_').txt" 2>/dev/null
+    done
+    cat "$WORKDIR"/enum/*/*.txt 2>/dev/null >> "$WORKDIR/raw_subs.txt"
+
+    clean_subs
+    resolve
+    reverse_dns_expand
+
+    # Enrichment is a single short network read (Team Cymru bulk, ~5s). Run it
+    # FIRST, on its own, so the nc stream isn't truncated by competing traffic.
+    enrich_ips
+
+    # The remaining three stages are independent and network/CPU-bound, so run
+    # them concurrently (each logs to its own file, printed in order afterwards).
+    step "Ports + reverse-DNS/ping + HTTP  (running in parallel)"
+    scan_ports   > "$WORKDIR/log_ports.txt"  2>&1 &  local pp=$!
+    ptr_and_ping > "$WORKDIR/log_ptr.txt"    2>&1 &  local pr=$!
+    http_probe   > "$WORKDIR/log_http.txt"   2>&1 &  local ph=$!
+    wait "$pp" "$pr" "$ph"
+    cat "$WORKDIR"/log_ports.txt "$WORKDIR"/log_ptr.txt \
+        "$WORKDIR"/log_http.txt 2>/dev/null
+    rm -f "$WORKDIR"/log_*.txt
+
+    assemble
+    save_to_windows
+    report
+    send_telegram
+
+    echo
+    ok "${BOLD}Done.${NC} Full results: $FINAL"
+}
+
+main "$@"
