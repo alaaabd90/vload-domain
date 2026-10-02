@@ -261,7 +261,8 @@ resolve(){
 }
 
 build_resolvers(){
-    cat > "$WORKDIR/resolvers.txt" <<'EOF'
+    # Trusted, high-capacity public resolvers — always kept, never dropped.
+    cat > "$WORKDIR/_trusted_res.txt" <<'EOF'
 8.8.8.8
 8.8.4.4
 1.1.1.1
@@ -272,17 +273,40 @@ build_resolvers(){
 208.67.220.220
 94.140.14.14
 94.140.15.15
-76.76.19.19
+76.76.2.0
+76.76.10.0
 77.88.8.8
 77.88.8.1
 84.200.69.80
 84.200.70.40
 EOF
+    cp "$WORKDIR/_trusted_res.txt" "$WORKDIR/_cand_res.txt"
     local extra
     extra=$(curl -sf --max-time 8 \
-        "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt" 2>/dev/null | head -400)
-    [ -n "$extra" ] && echo "$extra" >> "$WORKDIR/resolvers.txt"
+        "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt" 2>/dev/null | head -600)
+    [ -n "$extra" ] && echo "$extra" >> "$WORKDIR/_cand_res.txt"
+    sort -u "$WORKDIR/_cand_res.txt" -o "$WORKDIR/_cand_res.txt"
+
+    # ── Validate resolvers (CRITICAL for correctness) ────────────────────────
+    # Flaky/poisoned public resolvers return NOERROR-with-no-answer and silently
+    # drop valid CNAME-chained hosts (e.g. investor.fb.com → q4web.com → CF).
+    # Keep only resolvers that correctly answer a stable canary. ~2-3s, parallel.
+    info "Validating $(count "$WORKDIR/_cand_res.txt") resolvers..."
+    < "$WORKDIR/_cand_res.txt" xargs -P 80 -I{} bash -c '
+        a=$(dig +short +time=1 +tries=1 @{} one.one.one.one A 2>/dev/null \
+            | grep -E "^1\.(1\.1\.1|0\.0\.1)$" | head -1)
+        [ -n "$a" ] && echo {}
+    ' 2>/dev/null | sort -u > "$WORKDIR/resolvers.txt"
+    # Always include the trusted core, and fall back to it if validation failed.
+    cat "$WORKDIR/_trusted_res.txt" >> "$WORKDIR/resolvers.txt"
     sort -u "$WORKDIR/resolvers.txt" -o "$WORKDIR/resolvers.txt"
+    local n; n=$(count "$WORKDIR/resolvers.txt")
+    if [ "$n" -lt 10 ]; then
+        warn "resolver validation yielded only $n — using full candidate list"
+        cp "$WORKDIR/_cand_res.txt" "$WORKDIR/resolvers.txt"; n=$(count "$WORKDIR/resolvers.txt")
+    fi
+    ok "Using $n validated resolvers"
+    rm -f "$WORKDIR/_cand_res.txt" "$WORKDIR/_trusted_res.txt"
 }
 
 ###############################################################################
