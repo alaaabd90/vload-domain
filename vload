@@ -45,6 +45,7 @@ HTTP_TIMEOUT="${HTTP_TIMEOUT:-5}"
 NAABU_RATE="${NAABU_RATE:-5000}"         # naabu packets/sec
 PORTS_TO_SCAN="${PORTS_TO_SCAN:-80,443,8080,8443,8000,8888}"
 ENUM_TIMEOUT="${ENUM_TIMEOUT:-180}"      # hard cap per enumeration source (s)
+MAX_PARALLEL_DOMAINS="${MAX_PARALLEL_DOMAINS:-4}"  # domains enumerated at once (rest queue)
 CURL_TIMEOUT="${CURL_TIMEOUT:-25}"
 # Reverse-DNS (PTR) expansion tuning — the heaviest stage on big targets.
 PTR_MAX_NETS="${PTR_MAX_NETS:-1200}"     # max /24 subnets to sweep (densest first)
@@ -151,8 +152,12 @@ run_enumeration(){
         -o "$d/subfinder.txt" &>/dev/null ) &
     ( timeout -k 15 "$ENUM_TIMEOUT" assetfinder --subs-only "$domain" \
         > "$d/assetfinder.txt" 2>/dev/null ) &
+    # -dir isolates amass's graph database per invocation. Without it, every
+    # concurrent amass process shares ~/.config/amass/amass.sqlite: they race
+    # on the same local DB, which both drops results for some domains (lock
+    # contention) and bleeds OTHER domains' records into this domain's output.
     ( timeout -k 15 "$ENUM_TIMEOUT" amass enum -passive -d "$domain" \
-        -o "$d/amass.txt" &>/dev/null ) &
+        -dir "$d/amass_dir" -o "$d/amass.txt" &>/dev/null ) &
 
     $HAVE_FINDOMAIN && ( timeout -k 15 "$ENUM_TIMEOUT" findomain -t "$domain" -q \
         > "$d/findomain.txt" 2>/dev/null ) &
@@ -160,43 +165,39 @@ run_enumeration(){
     # crt.sh — Certificate Transparency. Use the plain ?q=<domain> query: the
     # %25. wildcard form returns 502 constantly, while the plain query returns
     # all SAN entries (incl. subdomains). name_value can hold newline-separated
-    # names. crt.sh is flaky, so retry a few times.
-    ( for try in 1 2 3; do
+    # names. crt.sh's backend is frequently overloaded (502s, or just hangs) —
+    # it's our only CT source now, so retry patiently with backoff.
+    ( for wait in 3 6 10 15; do
         timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time 40 \
             "https://crt.sh/?q=${domain}&output=json" 2>/dev/null \
             | jq -r '.[].name_value' 2>/dev/null \
             | tr ',' '\n' | sed 's/\\n/\n/g' > "$d/crtsh.txt"
-        [ -s "$d/crtsh.txt" ] && break; sleep 3
+        [ -s "$d/crtsh.txt" ] && break; sleep "$wait"
       done ) &
-
-    ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
-        "https://api.hackertarget.com/hostsearch/?q=${domain}" 2>/dev/null \
-        | cut -d',' -f1 > "$d/hackertarget.txt" ) &
 
     ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
         "https://rapiddns.io/subdomain/${domain}?full=1&down=1" 2>/dev/null \
         | grep -oE '[a-zA-Z0-9._-]+\.'"${domain//./\\.}" > "$d/rapiddns.txt" ) &
 
-    # certspotter — Certificate Transparency (another CT source, different coverage)
-    ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
-        "https://api.certspotter.com/v1/issuances?domain=${domain}&include_subdomains=true&expand=dns_names" 2>/dev/null \
-        | jq -r '.[].dns_names[]?' 2>/dev/null > "$d/certspotter.txt" ) &
-
-    # AlienVault OTX — passive DNS
-    ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
-        "https://otx.alienvault.com/api/v1/indicators/domain/${domain}/passive_dns" 2>/dev/null \
-        | jq -r '.passive_dns[]?.hostname' 2>/dev/null > "$d/otx.txt" ) &
+    # AlienVault OTX — url_list (NOT passive_dns: that endpoint now demands an
+    # API key and always 429s anonymously. url_list is still open/keyless and
+    # carries the same hostnames, just paginated — walk a few pages passively.)
+    ( : > "$d/otx.txt"
+      page=1
+      while [ "$page" -le 5 ]; do
+          resp=$(timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
+              "https://otx.alienvault.com/api/v1/indicators/domain/${domain}/url_list?limit=100&page=${page}" 2>/dev/null)
+          [ -z "$resp" ] && break
+          echo "$resp" | jq -r '.url_list[]?.hostname' 2>/dev/null >> "$d/otx.txt"
+          [ "$(echo "$resp" | jq -r '.has_next' 2>/dev/null)" = "true" ] || break
+          page=$((page + 1))
+      done ) &
 
     # Wayback Machine (web.archive.org) — historical hostnames
     ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
         "http://web.archive.org/cdx/search/cdx?url=*.${domain}&output=text&fl=original&collapse=urlkey&limit=50000" 2>/dev/null \
         | sed -E 's#^https?://##; s#/.*##; s#:.*##' \
         | grep -iE "\.${domain//./\\.}$" > "$d/wayback.txt" ) &
-
-    # subdomain.center — free aggregated passive source
-    ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
-        "https://api.subdomain.center/?domain=${domain}" 2>/dev/null \
-        | jq -r '.[]?' 2>/dev/null > "$d/subdomaincenter.txt" ) &
 
     # urlscan.io — hostnames from indexed page scans
     ( timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
@@ -391,6 +392,125 @@ reverse_dns_expand(){
 
     ok "After expansion: $(count "$WORKDIR/resolved.tsv") resolved subdomains → $(count "$WORKDIR/ips.txt") unique IPs"
     rm -f "$WORKDIR"/ptr_*.tmp "$WORKDIR/cidrs.tmp"
+}
+
+###############################################################################
+# 3c. Wildcard-DNS filtering — a zone with a wildcard A record (e.g. an org's
+#     internal "*.intern.example.com") makes ANY string under it "resolve",
+#     turning noise (mutated candidates from a source, a PTR sweep oddity,
+#     typos) into fake-looking confirmed subdomains. Standard practice (what
+#     subfinder/dnsx/amass all do): find such zones by querying one random,
+#     definitely-nonexistent label under each; if it resolves, every OTHER
+#     name under that zone sharing that same IP is indistinguishable noise
+#     and gets dropped. Zones are discovered from our OWN resolved data, not
+#     a wordlist — this only ever narrows results, never guesses new names.
+###############################################################################
+filter_wildcards(){
+    step "Wildcard-DNS filtering — dropping zones where any name resolves"
+    # Candidate zones = every ancestor of a resolved name, from one label
+    # dropped down to the matching target domain itself — a wildcard can sit
+    # at ANY depth (e.g. "intern.instagram.com", 3 levels under a 6-label
+    # host), not just one level up. Only test zones with >=3 resolved
+    # children (cheap to query, not worth it for a 1-2 off name) — cap the
+    # list so a huge run can't turn this into thousands of extra queries.
+    cut -f1 "$WORKDIR/resolved.tsv" | awk -v domlist="$(printf '%s\n' "${DOMAINS[@]}")" '
+        BEGIN{ nd=split(domlist,D,"\n") }
+        { host=$0; n=split(host,lab,".")
+          apexn=0
+          for(d=1;d<=nd;d++){ dom=D[d]; if(dom=="") continue
+              nda=split(dom,dl,"."); suf=""
+              for(i=n-nda+1;i<=n;i++) suf=(suf==""?lab[i]:suf"."lab[i])
+              if (suf==dom){ apexn=nda; break }
+          }
+          if (apexn==0) next
+          for (start=2; start<=n-apexn+1; start++){
+              suf=""
+              for(i=start;i<=n;i++) suf=(suf==""?lab[i]:suf"."lab[i])
+              print suf
+          }
+        }' | sort | uniq -c | awk '$1>=3{print $2}' | sort -u | head -n 500 > "$WORKDIR/_wc_cand.tmp"
+    local ncand; ncand=$(count "$WORKDIR/_wc_cand.tmp")
+    [ "$ncand" -eq 0 ] && { ok "No candidate zones to test"; rm -f "$WORKDIR/_wc_cand.tmp"; return 0; }
+    info "Testing $ncand zone(s) for wildcard A records..."
+
+    # Fire several random-label canaries per zone via plain `dig` against a
+    # small set of major, fast resolvers — a wildcard behind anycast/GSLB can
+    # answer with a different IP per resolver, so cycling through a handful
+    # of providers catches far more variants than one fixed resolver would.
+    # (Deliberately plain dig, not dnsx: dnsx carries its own built-in
+    # wildcard-detection heuristics that, in testing, interacted badly with
+    # feeding it synthetic wildcard-probe names — multi-minute stalls on
+    # batches as small as 3 queries. dig has none of that and is instant.)
+    local resolvers=(8.8.8.8 1.1.1.1 9.9.9.9 208.67.222.222 94.140.14.14 77.88.8.8)
+    : > "$WORKDIR/_wc_jobs.tsv"
+    local i=0 zone k r
+    while read -r zone; do
+        [ -z "$zone" ] && continue
+        for k in 0 1 2; do
+            r="${resolvers[$(( (i + k) % ${#resolvers[@]} ))]}"
+            printf '%s\t%s\n' "$zone" "$r" >> "$WORKDIR/_wc_jobs.tsv"
+        done
+        i=$((i + 1))
+    done < "$WORKDIR/_wc_cand.tmp"
+
+    < "$WORKDIR/_wc_jobs.tsv" xargs -P 60 -L1 bash -c '
+        zone="$1"; r="$2"
+        rand="zzwc$(tr -dc a-z0-9 </dev/urandom | head -c14)"
+        ip=$(dig +short +time=2 +tries=1 "${rand}.${zone}" A "@${r}" 2>/dev/null \
+             | grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$" | head -1)
+        [ -n "$ip" ] && printf "%s\t%s\n" "$zone" "$ip"
+    ' _ 2>/dev/null | sort -u > "$WORKDIR/_wc_zones.tsv"
+    rm -f "$WORKDIR/_wc_jobs.tsv"
+
+    local nwc_ips; nwc_ips=$(count "$WORKDIR/_wc_zones.tsv")
+    if [ "$nwc_ips" -eq 0 ]; then
+        ok "No wildcard zones detected"
+        rm -f "$WORKDIR/_wc_cand.tmp" "$WORKDIR/_wc_zones.tsv" 
+        return 0
+    fi
+    local nwc; nwc=$(cut -f1 "$WORKDIR/_wc_zones.tsv" | sort -u | wc -l | tr -d ' ')
+
+    # Final pass: for every resolved host, walk its ancestor zones (same
+    # suffixes considered as candidates above) and drop it if ANY of them is
+    # a confirmed wildcard zone. NOT IP-matched: in testing, the SAME
+    # wildcarded zone answered canary queries with several different IPs
+    # (anycast/GSLB load-balancing) — 57.144.120.146, 31.13.72.18, 157.240.9.7,
+    # 157.240.234.20 were all genuine wildcard answers for one zone. Once ANY
+    # name under a zone is confirmed to "resolve to something," no answer
+    # from that zone is distinguishable noise vs. a real record, so the whole
+    # zone's results are dropped — standard practice, same as subfinder/amass.
+    cut -f1 "$WORKDIR/_wc_zones.tsv" | sort -u > "$WORKDIR/_wc_zoneset.tmp"
+    awk -F'\t' -v wcfile="$WORKDIR/_wc_zoneset.tmp" -v domlist="$(printf '%s\n' "${DOMAINS[@]}")" '
+        BEGIN{ nd=split(domlist,D,"\n")
+               while((getline line < wcfile) > 0){ wc[line]=1 } }
+        { host=$1; n=split(host,lab,".")
+          apexn=0
+          for(d=1;d<=nd;d++){ dom=D[d]; if(dom=="") continue
+              nda=split(dom,dl,"."); suf=""
+              for(i=n-nda+1;i<=n;i++) suf=(suf==""?lab[i]:suf"."lab[i])
+              if (suf==dom){ apexn=nda; break }
+          }
+          hit=0
+          if (apexn>0){
+              for (start=2; start<=n-apexn+1 && !hit; start++){
+                  suf=""
+                  for(i=start;i<=n;i++) suf=(suf==""?lab[i]:suf"."lab[i])
+                  if (suf in wc) hit=1
+              }
+          }
+          if (hit) { dropped++; next }
+          print > "'"$WORKDIR"'/resolved.tsv.clean"
+        }
+        END{ print dropped+0 > "'"$WORKDIR"'/_wc_dropped.tmp" }
+    ' "$WORKDIR/resolved.tsv"
+    rm -f "$WORKDIR/_wc_zoneset.tmp"
+
+    local ndropped; ndropped=$(cat "$WORKDIR/_wc_dropped.tmp" 2>/dev/null || echo 0)
+    mv "$WORKDIR/resolved.tsv.clean" "$WORKDIR/resolved.tsv" 2>/dev/null
+    sort -u "$WORKDIR/resolved.tsv" -o "$WORKDIR/resolved.tsv"
+    cut -f2 "$WORKDIR/resolved.tsv" | sort -u > "$WORKDIR/ips.txt"
+    ok "$nwc wildcard zone(s) found — dropped $ndropped wildcard-noise hostname(s)"
+    rm -f "$WORKDIR/_wc_cand.tmp" "$WORKDIR/_wc_zones.tsv" "$WORKDIR/_wc_dropped.tmp" 
 }
 
 ###############################################################################
@@ -741,17 +861,26 @@ main(){
     : > "$WORKDIR/raw_subs.txt"
     mkdir -p "$WORKDIR/enum"
 
-    # Enumerate every domain IN PARALLEL (each already runs its ~12 sources
-    # concurrently). For N domains this turns N×T into ~T. Each domain logs to
-    # its own file, printed in order afterwards; sources merge once all finish.
-    local d epids=() dlog
-    for d in "${DOMAINS[@]}"; do
-        dlog="$WORKDIR/enum/_log_$(printf '%s' "$d" | tr -c 'a-zA-Z0-9' '_').txt"
-        run_enumeration "$d" > "$dlog" 2>&1 &
-        epids+=("$!")
+    # Enumerate domains in batches of MAX_PARALLEL_DOMAINS (each domain already
+    # runs its ~12 sources concurrently). Running ALL domains at once would fan
+    # out N×12 concurrent requests onto the SAME external hosts (crt.sh, OTX,
+    # hackertarget, urlscan, ...) and trip their per-IP rate limits — that's
+    # what silently zeroed out those sources on a 15-domain run. Capping
+    # concurrency here keeps per-domain yield consistent regardless of N.
+    local d epids=() dlog i total=${#DOMAINS[@]}
+    [ "$total" -gt 1 ] && info "Enumerating $total domain(s), ${MAX_PARALLEL_DOMAINS} at a time..."
+    i=0
+    while [ "$i" -lt "$total" ]; do
+        epids=()
+        local batch=("${DOMAINS[@]:$i:$MAX_PARALLEL_DOMAINS}")
+        for d in "${batch[@]}"; do
+            dlog="$WORKDIR/enum/_log_$(printf '%s' "$d" | tr -c 'a-zA-Z0-9' '_').txt"
+            run_enumeration "$d" > "$dlog" 2>&1 &
+            epids+=("$!")
+        done
+        wait "${epids[@]}"
+        i=$((i + MAX_PARALLEL_DOMAINS))
     done
-    [ "${#DOMAINS[@]}" -gt 1 ] && info "Enumerating ${#DOMAINS[@]} domains in parallel..."
-    wait "${epids[@]}"
     for d in "${DOMAINS[@]}"; do
         cat "$WORKDIR/enum/_log_$(printf '%s' "$d" | tr -c 'a-zA-Z0-9' '_').txt" 2>/dev/null
     done
@@ -760,6 +889,7 @@ main(){
     clean_subs
     resolve
     reverse_dns_expand
+    filter_wildcards
 
     # Enrichment is a single short network read (Team Cymru bulk, ~5s). Run it
     # FIRST, on its own, so the nc stream isn't truncated by competing traffic.

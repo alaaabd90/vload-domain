@@ -37,7 +37,7 @@ ports | http_code | title | webserver | tech | ping
 
 ## How it works
 
-1. **Enumerate** — subfinder, amass (passive), assetfinder, findomain, crt.sh, certspotter, AlienVault OTX, HackerTarget, RapidDNS, Wayback, subdomain.center, urlscan.io — all domains and sources in parallel.
+1. **Enumerate** — subfinder, amass (passive), assetfinder, findomain, crt.sh, AlienVault OTX, RapidDNS, Wayback, subdomain.center, urlscan.io — all domains and sources in parallel. All sources are free and require no API key. (`certspotter` and `hackertarget` were dropped: their anonymous quotas are exhausted globally and return nothing without a paid key; OTX now uses its still-open `url_list` endpoint instead of the auth-walled `passive_dns` one.)
 2. **Resolve** — the public-resolver set is first **validated** (flaky/poisoned resolvers that silently drop valid CNAME-chained hosts are removed), then a **two-pass** resolve runs: a fast bulk pass, followed by a patient, time-budgeted retry of only the leftovers to recover transient failures and slow CNAME chains.
 3. **Reverse-DNS expansion** — PTR-sweeps the /24 subnets of resolved IPs to find hosts no passive source lists (not a wordlist / brute-force).
 4. **Enrich** — org / ISP / country / ASN for every IP in one shot via Team Cymru bulk (no rate limits).
@@ -50,6 +50,7 @@ Every heavy stage is time-budgeted with partial-result flushing, so a run never 
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `MAX_PARALLEL_DOMAINS` | 4 | domains enumerated at once (rest queue in batches) — raising this fans out more concurrent requests onto the same external APIs (crt.sh, OTX, hackertarget, urlscan...) and can trip their rate limits, silently zeroing those sources on large multi-domain runs |
 | `DNS_THREADS` | 600 | dnsx resolution concurrency |
 | `DNS_RETRY` | 2 | first-pass resolution retries (set `1` for a faster run) |
 | `RESOLVE2_BUDGET` | 180 | time cap (s) for the patient 2nd resolve pass |
