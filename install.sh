@@ -34,7 +34,7 @@ need(){ command -v "$1" >/dev/null 2>&1; }
 declare -A VER=(
   [subfinder]="v2.14.0" [dnsx]="1.2.3"  [httpx]="v1.9.0"
   [naabu]="2.5.0"       [amass]="v4.2.0" [findomain]="9.0.4"
-  [assetfinder]="latest"
+  [assetfinder]="latest" [tlsx]="v1.4.0"
 )
 # Go module paths for the official fallback
 declare -A GOMOD=(
@@ -44,6 +44,7 @@ declare -A GOMOD=(
   [naabu]="github.com/projectdiscovery/naabu/v2/cmd/naabu"
   [amass]="github.com/owasp-amass/amass/v4/..."
   [assetfinder]="github.com/tomnomnom/assetfinder"
+  [tlsx]="github.com/projectdiscovery/tlsx/cmd/tlsx"
 )
 
 banner(){
@@ -74,7 +75,7 @@ version_ok(){
   need "$t" || return 1
   [ "$want" = "latest" ] && return 0
   case "$t" in
-    subfinder|dnsx|naabu) have=$("$t" -version 2>&1 | grep -oiE '[0-9]+\.[0-9]+\.[0-9]+' | head -1);;
+    subfinder|dnsx|naabu|tlsx) have=$("$t" -version 2>&1 | grep -oiE '[0-9]+\.[0-9]+\.[0-9]+' | head -1);;
     httpx)                have=$(httpx -version 2>&1 | grep -oiE '[0-9]+\.[0-9]+\.[0-9]+' | head -1);;
     amass)                have=$(amass -version 2>&1 | grep -oiE '[0-9]+\.[0-9]+\.[0-9]+' | head -1);;
     findomain)            have=$(findomain --version 2>&1 | grep -oiE '[0-9]+\.[0-9]+\.[0-9]+' | head -1);;
@@ -143,6 +144,10 @@ main(){
   for t in subfinder dnsx httpx naabu amass assetfinder findomain; do
     ensure_tool "$t" || failed=1
   done
+  # Optional: tlsx enables the TLS certificate SAN expansion stage. vload
+  # skips that stage cleanly if it's missing, so a failure here is never
+  # fatal to the install — just report it separately from the required set.
+  if ensure_tool tlsx; then :; else warn "tlsx not installed — vload will skip TLS SAN expansion (all other stages still run)"; fi
   install_vload
   echo
   if [ "$failed" -eq 0 ]; then

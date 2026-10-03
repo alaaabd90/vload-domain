@@ -87,10 +87,11 @@ vload example.com
 | amass | v4.2.0 |
 | findomain | 9.0.4 |
 | assetfinder | latest |
+| tlsx (optional) | v1.4.0 |
 
 Plus system tools: `jq`, `curl`, `fping`, `whois`, `dnsutils` (`dig`), `ncat`.
 
-Optional (enables TLS certificate SAN expansion): `tlsx` — `go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest`.
+`tlsx` enables the TLS certificate SAN expansion stage; `install.sh` installs it automatically (from this repo's release, same as every other tool), and `vload` skips that one stage cleanly if it's ever missing.
 
 ## License
 
