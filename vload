@@ -143,6 +143,19 @@ setup_workspace(){
 }
 
 ###############################################################################
+# Fetch Common Crawl's current index ID(s) ONCE for the whole run (not once
+# per domain) — the two most recent crawls, for broader time coverage.
+# Left empty (CC_INDEXES="") if unreachable; every call site checks for that
+# and simply contributes nothing, same as any other source going dark.
+###############################################################################
+CC_INDEXES=""
+fetch_cc_index(){
+    local resp; resp=$(curl -sf --max-time 15 "https://index.commoncrawl.org/collinfo.json" 2>/dev/null)
+    [ -z "$resp" ] && { warn "Common Crawl index unreachable — that source will be skipped"; return 0; }
+    CC_INDEXES=$(echo "$resp" | jq -r '.[0:2][].id' 2>/dev/null | tr '\n' ' ')
+}
+
+###############################################################################
 # 1. Enumeration — every source runs in parallel, each with a hard timeout
 ###############################################################################
 run_enumeration(){
@@ -232,6 +245,23 @@ run_enumeration(){
         "https://urlscan.io/api/v1/search/?q=domain:${domain}&size=10000" 2>/dev/null \
         | jq -r '.results[]?.page.domain, .results[]?.task.domain' 2>/dev/null \
         | grep -iE "\.${domain//./\\.}$" > "$d/urlscan.txt" ) &
+
+    # Common Crawl — a separate large-scale web index with its own crawler,
+    # independent of Wayback/archive.org; can surface hosts neither that nor
+    # any CT-log-based source ever saw. $CC_INDEXES is fetched once globally
+    # (see fetch_cc_index) and left empty if Common Crawl is unreachable,
+    # in which case this contributes nothing rather than wasting time.
+    if [ -n "$CC_INDEXES" ]; then
+        ( : > "$d/commoncrawl.txt"
+          for idx in $CC_INDEXES; do
+              timeout -k 15 "$ENUM_TIMEOUT" curl -sf --max-time "$CURL_TIMEOUT" \
+                  "https://index.commoncrawl.org/${idx}-index?url=*.${domain}&output=json&limit=20000" 2>/dev/null \
+                  | jq -r '.url' 2>/dev/null \
+                  | sed -E 's#^https?://##; s#/.*##; s#:.*##' \
+                  | grep -iE "\.${domain//./\\.}$" >> "$d/commoncrawl.txt"
+          done
+          sort -u "$d/commoncrawl.txt" -o "$d/commoncrawl.txt" ) &
+    fi
 
     wait   # all sources finish (each is bounded by ENUM_TIMEOUT)
 
@@ -1041,6 +1071,7 @@ save_to_windows(){
 main(){
     echo -e "${CYAN}${BOLD}Subdomain Recon${NC}  —  $(date)"
     check_tools
+    fetch_cc_index
 
     DOMAINS=("$@")
     if [ "${#DOMAINS[@]}" -eq 0 ]; then
