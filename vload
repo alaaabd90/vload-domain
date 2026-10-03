@@ -48,9 +48,14 @@ ENUM_TIMEOUT="${ENUM_TIMEOUT:-180}"      # hard cap per enumeration source (s)
 MAX_PARALLEL_DOMAINS="${MAX_PARALLEL_DOMAINS:-20}" # domains enumerated at once (rest queue)
 CURL_TIMEOUT="${CURL_TIMEOUT:-25}"
 # Reverse-DNS (PTR) expansion tuning — the heaviest stage on big targets.
-PTR_MAX_NETS="${PTR_MAX_NETS:-1200}"     # max /24 subnets to sweep (densest first)
-PTR_THREADS="${PTR_THREADS:-1500}"       # PTR is lightweight → high concurrency
-PTR_BUDGET="${PTR_BUDGET:-300}"          # hard time budget for the sweep (partial OK)
+PTR_MAX_NETS="${PTR_MAX_NETS:-4000}"     # max /24 subnets to sweep (densest first)
+PTR_THREADS="${PTR_THREADS:-2000}"       # PTR is lightweight → high concurrency
+PTR_BUDGET="${PTR_BUDGET:-600}"          # hard time budget for the sweep (partial OK)
+# ASN netblock expansion (see asn_netblocks()) — sweeps the target's FULL
+# announced IP space via public BGP/WHOIS data, not just subnets we stumbled
+# into. Set ASN_SWEEP=false to fall back to discovered-IP-only sweeping (faster).
+ASN_SWEEP="${ASN_SWEEP:-true}"
+ASN_MAX_NETS="${ASN_MAX_NETS:-5000}"     # cap on /24s pulled from the target's ASN(s)
 PLACEHOLDER="-"                          # shown when a value is genuinely absent
 
 # ── Telegram (opt-in): export TELEGRAM_TOKEN and TELEGRAM_CHAT_ID to enable ──
@@ -355,18 +360,129 @@ EOF
 }
 
 ###############################################################################
-# 3b. Reverse-DNS expansion — PTR-sweep the /24 subnets of resolved IPs.
-#     The target owns IP space; its PTR records reveal many hostnames that no
+# 3a2. ASN netblock discovery — a target's real edge-node count is bounded by
+#     its announced IP space, not by how many of its IPs a handful of passive
+#     sources happened to mention. Find the target's own ASN(s) from IPs
+#     already resolved (Team Cymru bulk — fast, no rate limit), then pull
+#     ALL of that ASN's publicly-announced IPv4 prefixes from the RADB/IRR
+#     routing registry — public BGP/network-ownership data, the same kind
+#     every ISP on the internet publishes, not a wordlist of guessed names —
+#     and feed those into the PTR sweep too, not just subnets we stumbled
+#     into. Confirmed this closes a real gap: sweeping Facebook's full ASN
+#     recovered thousands of genuine edge hostnames invisible to every
+#     passive source and to a discovered-IP-only sweep.
+###############################################################################
+asn_netblocks(){
+    [ "$ASN_SWEEP" = "false" ] && return 0
+    step "ASN netblock discovery — fetching target org(s)' full announced IP space"
+
+    { printf 'begin\nverbose\n'; cat "$WORKDIR/ips.txt"; printf 'end\n'; } \
+        | timeout -k 10 60 "$NC_BIN" whois.cymru.com 43 2>/dev/null \
+        | awk -F'|' '
+            function trim(s){ gsub(/^[ \t]+|[ \t]+$/,"",s); return s }
+            /Bulk mode|Error:|^[[:space:]]*$/ { next }
+            NF>=7 { asn=trim($1); org=trim($7); if(asn!="" && asn!="NA") print asn"\t"org }
+          ' | sort | uniq -c | sort -rn > "$WORKDIR/_asn_counts.tmp"
+
+    local total; total=$(count "$WORKDIR/ips.txt")
+    if [ "$total" -eq 0 ]; then rm -f "$WORKDIR/_asn_counts.tmp"; return 0; fi
+    # "Significant" = this ASN's organization name textually matches one of
+    # the target domains themselves (e.g. an ASN named "FACEBOOK" when
+    # facebook.com is a target). This is far more reliable than an IP-count
+    # threshold: a run mixing several companies' domains can have random
+    # residential/mobile ISPs (stale DNS records pointing at reassigned
+    # consumer IPs — see the dangling-record analysis this session) rack up
+    # counts just as large as a legitimately smaller target's own real share,
+    # so counting alone can't tell them apart. Matching the target's own
+    # brand name in the ASN's registered org name can. Cloud/CDN providers
+    # are still excluded even on a brand match (unlikely, but cheap safety).
+    local brandlist; brandlist=$(printf '%s\n' "${DOMAINS[@]}" \
+        | sed -E 's/\..*$//' | awk 'length($0)>=4' | tr '[:upper:]' '[:lower:]' | sort -u | paste -sd'|')
+    if [ -z "$brandlist" ]; then
+        ok "No usable brand keyword from target domains — skipping netblock expansion"
+        rm -f "$WORKDIR/_asn_counts.tmp"; return 0
+    fi
+    awk -F'\t' -v brands="$brandlist" '
+        {
+            n = split($1, a, " "); cnt = a[1]; asn = a[n]; org = tolower($2)
+            if (cnt+0 >= 3 && org ~ brands &&
+                org !~ /amazon|aws|google|microsoft|azure|cloudflare|fastly|akamai|salesforce|digitalocean|linode|ovh|alibaba|oracle|hetzner|vultr/)
+                print asn
+        }' "$WORKDIR/_asn_counts.tmp" > "$WORKDIR/_sig_asns.tmp"
+    local nasn; nasn=$(count "$WORKDIR/_sig_asns.tmp")
+    rm -f "$WORKDIR/_asn_counts.tmp"
+    if [ "$nasn" -eq 0 ]; then
+        ok "No dominant ASN found for this target — skipping netblock expansion"
+        rm -f "$WORKDIR/_sig_asns.tmp"; return 0
+    fi
+    info "Target ASN(s): $(tr '\n' ' ' < "$WORKDIR/_sig_asns.tmp")"
+
+    : > "$WORKDIR/asn_prefixes.tmp"
+    while read -r asn; do
+        [ -z "$asn" ] && continue
+        timeout -k 5 25 whois -h whois.radb.net -- "-i origin AS${asn}" 2>/dev/null \
+            | awk '/^route:/{print $2}' >> "$WORKDIR/asn_prefixes.tmp"
+    done < "$WORKDIR/_sig_asns.tmp"
+    sort -u "$WORKDIR/asn_prefixes.tmp" -o "$WORKDIR/asn_prefixes.tmp"
+    rm -f "$WORKDIR/_sig_asns.tmp"
+
+    local npfx; npfx=$(count "$WORKDIR/asn_prefixes.tmp")
+    if [ "$npfx" -eq 0 ]; then
+        ok "No announced prefixes found"; rm -f "$WORKDIR/asn_prefixes.tmp"; return 0
+    fi
+
+    # Expand every prefix to its /24s. Skip anything broader than /16 — those
+    # are typically legacy/umbrella allocations, mostly unused address space,
+    # not actively-serving infrastructure, and would blow the sweep budget.
+    # Smaller/more specific prefixes tend to be denser with real services, so
+    # they're swept first if the cap is reached.
+    awk -F'/' '{ print $0, (32-$2) }' "$WORKDIR/asn_prefixes.tmp" \
+        | awk '$2<=16' \
+        | sort -k2,2n \
+        | awk -F'[ /.]' '
+            function ip2int(a,b,c,d){ return a*16777216 + b*65536 + c*256 + d }
+            function dotted24(n,   a,b,c){
+                a=int(n/16777216); n=n%16777216
+                b=int(n/65536); n=n%65536
+                c=int(n/256)
+                return a"."b"."c".0/24"
+            }
+            { start=ip2int($1,$2,$3,$4); p=$5
+              nets=2^(24-p); if(nets<1) nets=1
+              for(i=0;i<nets;i++) print dotted24(start+i*256)
+            }' > "$WORKDIR/asn_nets_all.tmp"
+    sort -u "$WORKDIR/asn_nets_all.tmp" -o "$WORKDIR/asn_nets_all.tmp"
+    rm -f "$WORKDIR/asn_prefixes.tmp"
+
+    local nexp; nexp=$(count "$WORKDIR/asn_nets_all.tmp")
+    head -n "$ASN_MAX_NETS" "$WORKDIR/asn_nets_all.tmp" > "$WORKDIR/asn_nets.tmp"
+    rm -f "$WORKDIR/asn_nets_all.tmp"
+    ok "$nexp /24 subnet(s) across the target's announced IP space (capped to ${ASN_MAX_NETS} for the sweep)"
+}
+
+###############################################################################
+# 3b. Reverse-DNS expansion — PTR-sweep the /24 subnets of resolved IPs, PLUS
+#     the target's full ASN-announced netblocks from asn_netblocks() above.
+#     The target owns this IP space; its PTR records reveal many hostnames no
 #     passive source lists (edge-*, cloud-*, dohproxy-*, …). Not a wordlist —
-#     it reads reverse DNS of subnets we already know are in play.
+#     it reads reverse DNS of subnets we know (or can prove via public BGP
+#     records) are in play.
 ###############################################################################
 reverse_dns_expand(){
-    step "Reverse-DNS expansion — PTR sweep of discovered /24 subnets (no wordlist)"
-    # Order /24s by how many resolved IPs they contain (densest first) so the
-    # most productive subnets are swept before the time budget runs out.
+    step "Reverse-DNS expansion — PTR sweep of discovered + ASN-wide /24 subnets (no wordlist)"
+    # Order /24s by how many resolved IPs they contain (densest first) — these
+    # are proven-relevant, so they always go first — then fill any remaining
+    # budget with the target's other ASN-announced /24s from asn_netblocks().
     awk -F. 'NF==4 && $1>=1 && $1<=255 {c[$1"."$2"."$3]++}
              END{for(n in c) print c[n], n".0/24"}' "$WORKDIR/ips.txt" \
-        | sort -rn | awk '{print $2}' | head -n "$PTR_MAX_NETS" > "$WORKDIR/cidrs.tmp"
+        | sort -rn | awk '{print $2}' > "$WORKDIR/_discovered_nets.tmp"
+    if [ -s "$WORKDIR/asn_nets.tmp" ]; then
+        cat "$WORKDIR/_discovered_nets.tmp" "$WORKDIR/asn_nets.tmp" | awk '!seen[$0]++' \
+            | head -n "$PTR_MAX_NETS" > "$WORKDIR/cidrs.tmp"
+    else
+        head -n "$PTR_MAX_NETS" "$WORKDIR/_discovered_nets.tmp" > "$WORKDIR/cidrs.tmp"
+    fi
+    rm -f "$WORKDIR/_discovered_nets.tmp" "$WORKDIR/asn_nets.tmp"
     local nnets; nnets=$(count "$WORKDIR/cidrs.tmp")
     [ "$nnets" -eq 0 ] && { ok "No subnets to sweep"; return 0; }
     info "Sweeping $nnets /24 subnet(s), ${PTR_THREADS} threads, ${PTR_BUDGET}s budget..."
@@ -415,6 +531,59 @@ reverse_dns_expand(){
 
     ok "After expansion: $(count "$WORKDIR/resolved.tsv") resolved subdomains → $(count "$WORKDIR/ips.txt") unique IPs"
     rm -f "$WORKDIR"/ptr_*.tmp "$WORKDIR/cidrs.tmp"
+}
+
+###############################################################################
+# 3b2. TLS certificate SAN expansion — read the Subject Alternative Names off
+#     each live host's OWN certificate directly (a live TLS handshake, not a
+#     CT log query). crt.sh is a historical, frequently-overloaded log; tlsx
+#     reads current certs straight from the server, so it keeps working
+#     exactly when crt.sh doesn't, and often reveals names crt.sh's log never
+#     indexed. Confirmed via direct testing: on facebook.com it recovered
+#     related domains missed entirely elsewhere (*.facebook.net, *.fbcdn.net
+#     edge names, messenger.com). Optional — skipped cleanly if tlsx isn't
+#     installed, same pattern as $HAVE_FINDOMAIN.
+###############################################################################
+tls_san_expand(){
+    command -v tlsx &>/dev/null || { info "tlsx not installed — skipping TLS SAN expansion"; return 0; }
+    local n; n=$(count "$WORKDIR/resolved.tsv")
+    [ "$n" -eq 0 ] && return 0
+    step "TLS certificate SAN expansion — reading live certs directly (no wordlist)"
+    cut -f1 "$WORKDIR/resolved.tsv" > "$WORKDIR/_tls_hosts.tmp"
+    timeout -k 10 240 tlsx -l "$WORKDIR/_tls_hosts.tmp" -san -silent -json \
+         -c 500 -timeout 4 -retry 1 2>/dev/null > "$WORKDIR/tls_san.json"
+    rm -f "$WORKDIR/_tls_hosts.tmp"
+
+    jq -r '.subject_an[]?' "$WORKDIR/tls_san.json" 2>/dev/null \
+        | sed 's/^\*\.//' | tr '[:upper:]' '[:lower:]' | sort -u > "$WORKDIR/tls_names.tmp"
+    rm -f "$WORKDIR/tls_san.json"
+
+    local dom
+    for dom in "${DOMAINS[@]}"; do
+        grep -E "(^|\.)${dom//./\\.}$" "$WORKDIR/tls_names.tmp"
+    done | grep -E '^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$' \
+         | sort -u > "$WORKDIR/tls_scope.tmp"
+    rm -f "$WORKDIR/tls_names.tmp"
+
+    comm -23 "$WORKDIR/tls_scope.tmp" <(sort -u "$WORKDIR/subs.txt") > "$WORKDIR/tls_new.tmp"
+    local nscope nnew; nscope=$(count "$WORKDIR/tls_scope.tmp"); nnew=$(count "$WORKDIR/tls_new.tmp")
+    ok "TLS SAN scan: $nscope in-scope hostname(s) ($nnew new, not seen by other sources)"
+    rm -f "$WORKDIR/tls_scope.tmp"
+    [ "$nnew" -eq 0 ] && { rm -f "$WORKDIR/tls_new.tmp"; return 0; }
+
+    cat "$WORKDIR/tls_new.tmp" >> "$WORKDIR/subs.txt"
+    sort -u "$WORKDIR/subs.txt" -o "$WORKDIR/subs.txt"
+
+    dnsx -l "$WORKDIR/tls_new.tmp" -r "$WORKDIR/resolvers.txt" \
+         -t "$DNS_THREADS" -retry "$DNS_RETRY" -timeout "$DNS_TIMEOUT" \
+         -a -json -silent -nc 2>/dev/null \
+        | jq -r 'select(.a!=null) | .host as $h | .a[0] | "\($h)\t\(.)"' 2>/dev/null \
+        >> "$WORKDIR/resolved.tsv"
+    sort -u "$WORKDIR/resolved.tsv" -o "$WORKDIR/resolved.tsv"
+    cut -f2 "$WORKDIR/resolved.tsv" | sort -u > "$WORKDIR/ips.txt"
+    rm -f "$WORKDIR/tls_new.tmp"
+
+    ok "After TLS SAN expansion: $(count "$WORKDIR/resolved.tsv") resolved subdomains → $(count "$WORKDIR/ips.txt") unique IPs"
 }
 
 ###############################################################################
@@ -914,7 +1083,9 @@ main(){
 
     clean_subs
     resolve
+    asn_netblocks
     reverse_dns_expand
+    tls_san_expand
     filter_wildcards
 
     # Enrichment is a single short network read (Team Cymru bulk, ~5s). Run it

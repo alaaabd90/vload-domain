@@ -39,10 +39,13 @@ ports | http_code | title | webserver | tech | ping
 
 1. **Enumerate** — subfinder, amass (passive), assetfinder, findomain, crt.sh, AlienVault OTX, RapidDNS, Wayback, urlscan.io — all domains and sources in parallel. All sources are free and require no API key. (`certspotter` and `hackertarget` were dropped: their anonymous quotas are exhausted globally and return nothing without a paid key. `api.subdomain.center` was dropped: its output contains algorithmically generated/mutated candidate names, not genuine passive observations — confirmed via duplicate-token artifacts in its responses — and amass's own built-in integration with it is excluded too. OTX now uses its still-open `url_list` endpoint instead of the auth-walled `passive_dns` one. findomain and amass also exclude several sources confirmed dead or quota-exhausted — ThreatCrowd, AnubisDB, ThreatMiner, SiteDossier, Riddler, bufferover — which were previously silently eating up to 120s+ per domain waiting on them for zero benefit.)
 2. **Resolve** — the public-resolver set is first **validated** (flaky/poisoned resolvers that silently drop valid CNAME-chained hosts are removed), then a **two-pass** resolve runs: a fast bulk pass, followed by a patient, time-budgeted retry of only the leftovers to recover transient failures and slow CNAME chains.
-3. **Reverse-DNS expansion** — PTR-sweeps the /24 subnets of resolved IPs to find hosts no passive source lists (not a wordlist / brute-force).
-4. **Enrich** — org / ISP / country / ASN for every IP in one shot via Team Cymru bulk (no rate limits).
-5. **Probe** — ports (`naabu`), HTTP (`httpx`), reverse-DNS + ping — in parallel, deduplicated per unique IP.
-6. **Assemble** — one fully-populated row per subdomain.
+3. **ASN netblock discovery** — a target's real edge-node count is bounded by its *announced IP space*, not by how many of its IPs a handful of passive sources happened to mention. Finds the target's own ASN(s) by matching ASN organization names against the target domains themselves (robust against stale DNS records pointing at reassigned residential IPs, which can otherwise rack up counts as large as a legitimately smaller target's own real share), then pulls that ASN's full announced IPv4 space from the public RADB/IRR routing registry — the same public BGP/network-ownership data every ISP publishes, not a wordlist.
+4. **Reverse-DNS expansion** — PTR-sweeps the /24 subnets of resolved IPs *and* the ASN-wide netblocks above, to find hosts no passive source lists (not a wordlist / brute-force).
+5. **TLS certificate SAN expansion** — reads the Subject Alternative Names directly off each live host's own certificate (a live TLS handshake, not a CT log query). Keeps working when crt.sh is down (a frequent occurrence) and often reveals names crt.sh's log never indexed. Requires `tlsx` (optional — skipped cleanly if not installed).
+6. **Wildcard-DNS filtering** — a target's internal zone (e.g. `intern.example.com`) can wildcard-resolve ANY string to a real IP, turning noise into fake "confirmed" subdomains. Detects such zones from the run's own resolved data (never a wordlist) and drops them wholesale.
+7. **Enrich** — org / ISP / country / ASN for every IP in one shot via Team Cymru bulk (no rate limits).
+8. **Probe** — ports (`naabu`), HTTP (`httpx`), reverse-DNS + ping — in parallel, deduplicated per unique IP.
+9. **Assemble** — one fully-populated row per subdomain.
 
 Every heavy stage is time-budgeted with partial-result flushing, so a run never hangs or crashes — even for many domains and tens of thousands of subdomains.
 
@@ -55,8 +58,10 @@ Every heavy stage is time-budgeted with partial-result flushing, so a run never 
 | `DNS_RETRY` | 2 | first-pass resolution retries (set `1` for a faster run) |
 | `RESOLVE2_BUDGET` | 180 | time cap (s) for the patient 2nd resolve pass |
 | `HTTP_THREADS` | 400 | httpx concurrency |
-| `PTR_MAX_NETS` | 1200 | max /24 subnets for reverse-DNS sweep |
-| `PTR_BUDGET` | 300 | hard time budget (s) for the sweep |
+| `PTR_MAX_NETS` | 4000 | max /24 subnets for reverse-DNS sweep (discovered-IP subnets + ASN-wide netblocks combined) |
+| `PTR_BUDGET` | 600 | hard time budget (s) for the sweep |
+| `ASN_SWEEP` | true | fetch and sweep the target's full ASN-announced IP space (set `false` to sweep only discovered-IP subnets — faster, less thorough) |
+| `ASN_MAX_NETS` | 5000 | cap on /24s pulled from the target's own ASN(s) |
 | `NAABU_RATE` | 5000 | port-scan packets/sec |
 | `PORTS_TO_SCAN` | 80,443,8080,8443,8000,8888 | ports to scan |
 | `OUTBASE` | `~/recon` | output directory |
@@ -84,6 +89,8 @@ vload example.com
 | assetfinder | latest |
 
 Plus system tools: `jq`, `curl`, `fping`, `whois`, `dnsutils` (`dig`), `ncat`.
+
+Optional (enables TLS certificate SAN expansion): `tlsx` — `go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest`.
 
 ## License
 
